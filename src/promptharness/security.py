@@ -38,7 +38,7 @@ _REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\b(gh[pousr])_[A-Za-z0-9]{16,}"), r"\1_***"),
     (
         re.compile(
-            r"(?i)(?<![A-Za-z0-9_])([A-Za-z0-9_]{0,64}(?:api[_-]?key|token|secret|password))"
+            r"(?i)(?<![A-Za-z0-9_])([A-Za-z0-9_]*(?:api[_-]?key|token|secret|password))"
             r"[\"']?\s*[=:]\s*"
             r"(?:\"(?:[^\"\\]|\\.)*\"\S*|'(?:[^'\\]|\\.)*'\S*|\S+)"
         ),
