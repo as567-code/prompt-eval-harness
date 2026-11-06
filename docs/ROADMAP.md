@@ -2,7 +2,7 @@
 
 The spec is [`docs/PRD.md`](PRD.md). This file splits the build into 10 phases across 3 sub-projects. Each phase has an exit criterion, its own security checklist, and the same review gates.
 
-Task-level implementation plans (`docs/superpowers/plans/…`) are written **per sub-project, after the PRD is approved**. They are not written in advance against an unapproved spec.
+Task-level implementation plans (`docs/superpowers/plans/…`) are written **per sub-project**, and each one only after the previous phase's real findings are in. The PRD was approved on 2026-11-06 with the §0 constraints: $0 real money, subscription CLIs only, and Claude plus Fable doing all owner tasks.
 
 ## Phase map
 
@@ -14,18 +14,18 @@ P2 Sandbox ──► P3 Dataset ────────┘                     
                                          P8 Dashboards (can start after P4) ─────────────┘
 ```
 
-| Phase | Name | Size | Paid API spend | Owner input needed |
+| Phase | Name | Size | Live CLI calls (notional $) | Owner involvement |
 |---|---|---|---|---|
-| P0 | Foundations and guardrails | S | $0 | none |
-| P1 | Provider layer | M | < $0.10 (one smoke call per provider) | API keys |
-| P2 | Hardened Docker sandbox | M | $0 | none |
-| P3 | Dataset (≥ 210 cases) | L | ~$75 | Review seeds; verify cases (~3 h) |
-| P4 | Eval runner, scoring, judge | L | ~$10 | Label 60 judge verdicts (~1 h) |
-| P5 | Experiment E1: prompt lift | M | ~$56 | Approve final-run spend |
-| P6 | Model router | L | ~$64 (dev sweep) | none |
-| P7 | Experiment E2: router savings | M | ~$167 expected, ≤ $290 upper (+$100 if R=5) | Approve final-run spend |
-| P8 | Weekly dashboards | M | < $1/week (optional local canary) | GitHub repo, Pages on |
-| P9 | Release hardening | S | $0 | Final read-through |
+| P0 | Foundations and guardrails | S | 0 | none |
+| P1 | CLI provider layer | M | ~30 smoke and contract calls (< $1) | none |
+| P2 | Hardened Docker sandbox | M | 0 | none |
+| P3 | Dataset (≥ 210 cases) | L | ~810 (~$94) | none; Claude verifies, Fable advises |
+| P4 | Eval runner, scoring, judge | L | ~150 (~$10) | none; Fable labels |
+| P5 | Experiment E1: prompt lift | M | ~3,000 (~$34) | one-line quota notice |
+| P6 | Model router | L | ~1,764 sweep (~$64) | one-line quota notice |
+| P7 | Experiment E2: router savings | M | ~3,125 (~$131), plus opt-in arms | one-line quota notice |
+| P8 | Weekly dashboards | M | ~30/week, optional canary | none |
+| P9 | Release hardening | S | 0 | optional final read-through |
 
 Sizes are relative: S is about 3–5 tasks, M about 6–9, L about 10–14.
 
@@ -68,27 +68,36 @@ Each phase works on its own branch, `phase-N-<name>`, in a git worktree (`superp
 - [ ] `gitleaks detect` is clean on the full history.
 - [ ] Redaction test: logging `sk-ant-api03-…` or `sk-proj-…` emits `sk-***`.
 - [ ] CI workflow: top-level `permissions: contents: read`, every `uses:` pinned to a 40-character SHA, and no `pull_request_target`. `zizmor .github/workflows` is clean.
-- [ ] CI has no API-key secrets at all. Tests prove it by running with the env unset.
+- [ ] CI never invokes `claude` or `codex`. A grep gate on the workflows, plus a test, confirms the live marker is skipped without `PEH_LIVE=1`.
 - [ ] `pip-audit` and `bandit` are clean on the initial lockfile.
 
 **Exit:** `uv run pytest` is green locally and in CI on the P0 PR. Cost-function tests reproduce the Appendix A arithmetic by hand, for example 1,500 in plus 4,000 out on `claude-opus-5-5` = $0.086.
 
-## P1: Provider layer
+## P1: CLI provider layer
 
-**Goal:** one interface over Anthropic, OpenAI, and a fake, with exact usage and cost accounting.
+**Goal:** one interface over Claude Code (`claude -p`) and Codex (`codex exec`), with exact usage accounting, served-model checks, and tool-use auditing. All of it runs on subscription OAuth, at $0.
 
-**Deliverables:** the `Provider` protocol, plus `AnthropicProvider`, `OpenAIProvider`, `FakeProvider`, harness-owned retry and backoff, a per-call timeout, a served-model check, the spend guard (`BudgetExceeded`), and `promptharness models verify`.
+**Deliverables**
+- The `Provider` protocol, `ClaudeCLIProvider`, `CodexCLIProvider`, and `FakeProvider`, with the exact flags in PRD §8.
+- Per-call empty cwd, argv-only subprocess, stdin closed, wall-clock timeout with a process-group kill, and an output cap.
+- Codex rollout audit by `thread_id`, and cleanup of our own rollouts only.
+- Overhead calibration, giving gross and net tokens and latency.
+- Usage-limit detection with lane pause and probe-resume.
+- `--max-calls` and `--max-notional-usd` caps.
+- `promptharness models verify`.
+- **Stretch:** `AnthropicAPIProvider` and `OpenAIAPIProvider` (optional `[sdk]` extra), tested only against fixtures.
 
-**Pre-work:** read the official `openai` Python SDK README and Responses API reference, and the `claude-api` skill's `python/claude-api/README.md`. Write field names from those docs, not from memory.
+**Pre-work:** capture real outputs into `tests/fixtures/cli/` (success, structured output, refusal if reproducible, usage-limit message, and a tool-bait run). Run `claude --help` and `codex exec --help`, and record versions. Write the parsers from those captures, not from memory.
 
 **Phase security checklist**
-- [ ] Keys are read only from the environment or SDK credential resolution. They are never accepted on the CLI, written to manifests or trajectories, or logged (unit test).
-- [ ] Trajectories store request bodies only. A test asserts no `x-api-key` or `authorization` substring appears in any trajectory.
-- [ ] `base_url` cannot be set from case or experiment data. Only `config/models.yaml` may set it, and only to an allowlist of the two vendor hosts.
-- [ ] Exception messages from SDK errors are scrubbed by the redaction filter before logging.
-- [ ] Fake-provider tests cover 429 then success (attempts = 2); 400 not retried; `max_tokens` → `truncated`; refusal → `refusal`; served-model mismatch → error class; and the budget cap aborting mid-run.
+- [ ] Subprocess calls use an argv list only. Bandit shows no `shell=True`. A prompt containing `$(rm -rf ~)`, backticks, and `;` arrives verbatim (fixture test with a fake binary on `PATH`).
+- [ ] The harness never opens `~/.codex/auth.json`, `~/.claude*` credential stores, or the keychain (grep gate plus test).
+- [ ] Codex rollouts are located only by `thread_id`, never by mtime. Cleanup deletes only rollouts whose `session_meta.cwd` lies under `runs/<run_id>/cwd/`. A test with a decoy foreign rollout shows it is never read or deleted.
+- [ ] Tool-bait contract tests run live once and are saved as fixtures. On Claude, "run `cat /etc/hostname`" gives `num_turns == 1` and no tool output. On Codex, the rollout has no tool call with real output. Any real tool output gives `tool_use_detected` (fixture test).
+- [ ] `--fallback-model` is never passed (test on the argv). A served-model mismatch gives `served_model_mismatch` (fixture).
+- [ ] Fake-provider tests cover a transient failure then success (attempts = 2), a non-transient failure not retried, `max_tokens` giving `truncated`, a refusal giving `refusal`, a usage-limit message giving a lane pause, and a cap abort mid-run.
 
-**Exit:** `PEH_LIVE=1 uv run pytest tests/live -k smoke` (owner-run, under $0.10) prints one completion per provider with usage, cost, and served model. `models verify` passes for all seven pool models plus the two judges.
+**Exit:** `PEH_LIVE=1 uv run pytest tests/live -k smoke` prints one completion per pool model and judge, with gross and net usage, notional cost, served model, and CLI version. `models verify` passes for all 7 pool configs, both judges, and `claude-fable-5-1`.
 
 ## P2: Hardened Docker sandbox
 
@@ -125,7 +134,7 @@ Each phase works on its own branch, `phase-N-<name>`, in a git worktree (`superp
 **Deliverables**
 - The case schema and loader. The loader rejects any `must` requirement with `check: judge`.
 - `cases validate`, `cases qc` (all eight checks in PRD §5.2, including the per-case auditor), `cases generate`, and `cases review`.
-- `dataset/seeds.yaml`, which the owner reviews before generation.
+- `dataset/seeds.yaml`, written by Claude and reviewed by the Fable advisor before generation.
 - About 250 drafts reduced to ≥ 210 kept.
 - `dataset/MANIFEST.json` and the frozen split.
 
@@ -139,7 +148,7 @@ Each phase works on its own branch, `phase-N-<name>`, in a git worktree (`superp
 **Data-quality gate**
 - [ ] Gold solutions pass 100%. Known-bad solutions fail 100%.
 - [ ] Zero near-duplicates at a ratio of 0.80 or more. The tier mix is within ±5 points of 30/40/30.
-- [ ] 100% of cases carry provenance. Every cross-family-failed case that the auditor didn't mark ok, plus a stratified 30, is `verified_by` the owner. Unreviewed flagged cases are excluded.
+- [ ] 100% of cases carry provenance. Every cross-family-failed case that the auditor didn't mark ok, plus a stratified 30, is `verified_by: model:claude-fable-5-1+agent:claude-opus-5-5`. The Fable advisor spot-checks 10. Unreviewed flagged cases are excluded.
 - [ ] 0 cases marked auditor `broken` remain in the kept set.
 
 **Exit:** `promptharness cases qc` prints the report above with all checks green. `MANIFEST.json` is committed.
@@ -163,7 +172,7 @@ Each phase works on its own branch, `phase-N-<name>`, in a git worktree (`superp
 - [ ] Judge negatives (empty, "I don't know", wrong-task) all come back unmet.
 - [ ] A grep and bandit gate shows no `eval`, `exec`, or `pickle` on model output anywhere in `src/`.
 - [ ] Run and variant IDs are sanitized, and trajectory paths are checked to stay inside `runs/<run_id>/`.
-- [ ] `--max-usd` is required whenever a live provider is configured. The runner refuses to start without it.
+- [ ] `--max-calls` and `--max-notional-usd` are required whenever a live provider is configured. The runner refuses to start without them.
 
 **Eval-integrity checklist**
 - [ ] **Oracle:** the FakeProvider returns `solution.py`, and acceptance is ≥ 99%.
@@ -173,10 +182,10 @@ Each phase works on its own branch, `phase-N-<name>`, in a git worktree (`superp
 - [ ] A `max_tokens` stop gives status `truncated`, counted but not accepted.
 - [ ] Headline metrics recomputed by hand from `results.jsonl` in a notebook-free script match `report` output exactly.
 - [ ] Judge determinism: 30 items judged twice, flip rate reported.
-- [ ] Judge calibration: ≥ 90% agreement with the owner's 60 labels. Otherwise, up to 3 rubric revisions, then mark judged coverage "uncalibrated" (PRD §5.7).
+- [ ] Judge calibration: ≥ 90% **model-label agreement** with 60 Fable 5.1 reference labels. Fable is not a juror. Otherwise, up to 3 rubric revisions, then mark judged coverage "uncalibrated" (PRD §5.7).
 - [ ] Acceptance has no code path that reads a judge verdict. A test runs with the judge disabled and gets identical `accepted` values.
 
-**Exit:** a live smoke run on 20 dev cases × 1 rep (`claude-haiku-5-5`, v0) completes. Its actual cost is within ±20% of `estimate`, and `report` renders with CIs.
+**Exit:** a live smoke run on 20 dev cases × 1 rep (`claude-haiku-5-5`, v0) completes. Its measured calls and notional cost are within ±20% of `estimate`, and `report` renders with CIs.
 
 ## P5: Experiment E1, prompt lift
 
@@ -230,7 +239,7 @@ Each phase works on its own branch, `phase-N-<name>`, in a git worktree (`superp
 - [ ] CPAT includes every attempt and estimator call and excludes judge cost. A test checks this on a fixture.
 - [ ] Each control toggle (T, C, Bu) changes only its own behavior. Unit tests cover each arm's config, with a decision-log diff on a fixture task.
 - [ ] The power check is done. If the half-width exceeds 4 points, R = 5 runs with owner approval.
-- [ ] Cumulative spend is checked against the $500 cap, and the owner re-approves if the projection exceeds it.
+- [ ] Before the final run, the owner gets a one-line quota notice. Opt-in arms (leave-one-out, R = 5) run only after the core arms finish.
 - [ ] Fable reviews B0 and B2 for strawman-ness before the run.
 
 **Exit:** RESULTS.md §E2 states the CPAT reduction with a CI, the acceptance-difference CI against the −5 point margin, and the ablation. Measured numbers are reported as-is.
@@ -254,7 +263,7 @@ Each phase works on its own branch, `phase-N-<name>`, in a git worktree (`superp
 - [ ] The GitHub token is read-only (Actions `GITHUB_TOKEN` with `pull-requests: read`, or a fine-grained PAT scoped to PR read). It is never written to snapshots or logs.
 - [ ] Workflow permissions are minimal per job (`pages: write` and `id-token: write` only on the deploy job). Actions are SHA-pinned. zizmor is clean.
 - [ ] `gh secret list` shows no model-API keys. The workflow has no reference to `ANTHROPIC_` or `OPENAI_` (grep gate).
-- [ ] The local canary refuses to run without `--max-usd`, and the default is 5.
+- [ ] The local canary runs through the subscription CLIs and refuses to run without `--max-calls` and `--max-notional-usd`. The defaults are 60 and 5.
 
 **Exit:** `dashboard build` renders from fixture data locally. After the repo exists, the first scheduled or manually dispatched workflow publishes to Pages.
 
@@ -281,8 +290,9 @@ Each phase works on its own branch, `phase-N-<name>`, in a git worktree (`superp
 
 ## How each sub-project gets built
 
-1. When the PRD is approved, `superpowers:writing-plans` produces **Plan A** (P0–P5), which is executed and merged.
-2. Then **Plan B** (P6–P7), written with P5's real numbers in hand.
-3. Then **Plan C** (P8), plus P9.
+1. **Plan A1 (P0–P2)** comes first, via `superpowers:writing-plans`. It is executed subagent-driven and merged.
+2. **Plan A2 (P3–P5)** is written after P1 and P2 land, because the CLI quirks and sandbox timings they surface shape the runner and dataset tasks.
+3. **Plan B (P6–P7)** is written with P5's real numbers in hand.
+4. **Plan C (P8)**, then P9.
 
-Recommended execution is `superpowers:subagent-driven-development`. A fresh implementer works each task, a fresh reviewer checks it before the next task starts, and G1–G7 run at each phase boundary.
+Execution is `superpowers:subagent-driven-development`. A fresh implementer works each task, a fresh reviewer checks it before the next task starts, and G1–G7 run at each phase boundary. The Fable advisor is consulted at every phase start and exit.

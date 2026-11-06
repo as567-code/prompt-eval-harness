@@ -2,13 +2,24 @@
 
 | | |
 |---|---|
-| Status | Draft, awaiting owner approval |
+| Status | Approved by owner 2026-11-06, with the execution constraints in §0 |
 | Date | 2026-11-06 |
 | Owner | Aditya Swaroop |
-| Repo | `~/prompt-eval-harness` |
+| Repo | `~/prompt-eval-harness`, public on GitHub |
 | Companion | [`docs/ROADMAP.md`](ROADMAP.md): phases, per-phase security checks, review gates |
 
 ---
+
+## 0. Execution constraints (owner, 2026-11-06)
+
+1. **$0 real money.** Every live model call goes through a vendor CLI that is already signed in with the owner's subscription OAuth:
+   - `claude -p` (Claude Code) for Claude models.
+   - `codex exec` (Codex CLI, ChatGPT login) for OpenAI models.
+
+   No API keys exist anywhere in this project.
+2. **Costs are notional.** Every cost figure is a *list-price equivalent* computed from token usage. Actual spend is $0. The scarce resource is **subscription quota**, so sizes default to lean (§12), and the runner pauses and resumes across usage-limit windows.
+3. **No owner labor.** Every task that §15 previously gave the owner is done by Claude, with Fable 5.1 as auditor and advisor. That covers seed review, case verification, and judge-calibration labels. These become *independent model verification*, never human verification. RESULTS.md says plainly that no human labels were used.
+4. **The repo is public.** The dataset, including hidden tests, is public (§17).
 
 ## 1. Intent
 
@@ -29,7 +40,8 @@ Every clause must be backed by working code, and every number by a reproducible 
 | "correctness … automated pytest checks" | §5.5–5.6 | Hidden pytest suite per case, run in sandbox |
 | "requirement coverage" | §5.6 | Per-requirement verdicts (test-mapped, static, or judged) |
 | "consistency" | §5.6 | R reps per (case, variant): pass^R and outcome-agreement rate |
-| "LLM-as-judge" | §5.7 | Two-family judge jury, calibrated against owner labels |
+| "OpenAI & Anthropic" | §8 | Provider layer over both vendors. Live calls go through the official CLIs (`claude -p`, `codex exec`). SDK adapters are tested against fixtures only. P9's claim table says which path produced every number. |
+| "LLM-as-judge" | §5.7 | Two-family judge jury, calibrated against independent reference labels from Fable 5.1 |
 | "Docker sandboxes" | §5.5, §9 | Hardened `docker run`, adversarial containment suite |
 | "raising first-pass acceptance 35%" | §5.10 (Experiment E1) | Relative lift of attempt-1 acceptance, prompt vN vs v0, held-out split |
 | "router … complexity, latency, and cost" | §6.2–6.4 | Policy fitted from sweep data; the R-slo arm in E2 shows SLO attainment |
@@ -45,7 +57,7 @@ Every clause must be backed by working code, and every number by a reproducible 
 2. Containment. LLM-written code can never reach the host's network, filesystem, or secrets.
 3. A router whose savings are measured against an honest baseline, with each control's contribution isolated.
 4. Weekly dashboards that a teammate can read without running anything.
-5. CI costs $0. All tests run against fake providers. **No API key is ever stored in CI or GitHub secrets.** Paid runs happen only on the owner's machine, and each one is explicit, estimated first, and capped.
+5. **Everything costs $0.** CI runs only against fake providers and never calls a model. Live runs happen only on the owner's machine, through the subscription CLIs. Each live run is estimated first, in calls and notional cost, and is capped by a call count and a notional-cost limit.
 
 **Non-goals for v1.** These are deliberately excluded and can be revisited later.
 - Languages other than Python. Multi-file repo tasks (SWE-bench style). Cases are single-module, with optional read-only context files.
@@ -135,7 +147,7 @@ The static checks are a fixed registry implemented with `ast`, never `exec`: `st
 ### 5.2 Dataset build and QC
 
 - **Size.** Generate about 250 draft cases and keep ≥ 210 after QC. The target mix is simple 30%, moderate 40%, complex 30%, spread across the six categories.
-- **Generation.** `cases generate` reads `dataset/seeds.yaml`, which the owner reviews: one line per case giving topic, category, and tier. It drafts every file with `claude-opus-5-5` at effort `high`. Model output is untrusted. It is schema-validated before anything is written, and nothing it produces executes outside the sandbox.
+- **Generation.** `cases generate` reads `dataset/seeds.yaml`, which has one line per case giving topic, category, and tier. Claude writes the seeds and the Fable advisor reviews them. Every file is drafted with `claude-opus-5-5` at effort `high` through `claude -p`. Model output is untrusted. It is schema-validated before anything is written, and nothing it produces executes outside the sandbox.
 - **Novelty.** Tasks use invented domains and specifications, not well-known puzzles, so models cannot answer from memory.
 - **QC gate (`cases qc`).** A case is kept only if every check passes:
   1. Schema valid, with file names matching `^[a-z0-9_]+\.py$` and inside the case directory.
@@ -144,9 +156,9 @@ The static checks are a fixed registry implemented with `ast`, never `exec`: `st
   4. Every `check: test` requirement names ≥ 1 existing hidden test.
   5. Static checks pass on `solution.py`.
   6. No near-duplicate. Normalized prompt similarity, measured with `difflib.SequenceMatcher` ratio, stays below 0.80 against every other case.
-  7. **Cross-family solve flag.** `gpt-6.1-sol` writes a solution from the prompt alone. A failure doesn't drop the case. It flags it for review, because the case may be hard or it may be ambiguous.
-  8. **Per-case auditor** (eval-audit tier 3). `claude-opus-5-5` reads the prompt, tests, and gold, and returns `ok | review | broken`, with flags for ambiguity, a suspect gold, being answerable from memory, a grader that is too strict or too lenient, and cheatability. Cases marked `broken` are regenerated or dropped.
-- **Human verification.** The owner reviews (a) every case that failed the cross-family solve and that the auditor did not mark `ok`, and (b) a stratified random sample of 30. The owner then sets `provenance.verified_by`. Flagged cases that are never reviewed are excluded. Enough extra drafts are generated that ≥ 210 cases remain with the tier mix within ±5 points.
+  7. **Cross-family solve flag.** `gpt-6.1-sol` (via `codex exec`) writes a solution from the prompt alone. A failure doesn't drop the case. It flags it for review, because the case may be hard or it may be ambiguous.
+  8. **Per-case auditor** (eval-audit tier 3). `claude-fable-5-1` at effort `high` (via `claude -p`) reads the prompt, tests, and gold. It returns `ok | review | broken`, with flags for ambiguity, a suspect gold, being answerable from memory, a grader that is too strict or too lenient, and cheatability. Fable is a different model from the Opus generator. Cases marked `broken` are regenerated or dropped.
+- **Independent model verification.** Claude reviews (a) every case that failed the cross-family solve and that the auditor did not mark `ok`, and (b) a stratified random sample of 30. Claude then fixes, drops, or confirms each one, and the Fable advisor spot-checks 10 of those decisions. `provenance.verified_by` records `model:claude-fable-5-1+agent:claude-opus-5-5`, never a human name. Flagged cases that are never reviewed are excluded. Enough extra drafts are generated that ≥ 210 cases remain with the tier mix within ±5 points.
 - **Split.** A seeded split, stratified by tier × category, assigns 60% dev and 40% test (126 / 84 at 210 cases). It is written into each `case.yaml` and never re-drawn based on scores.
 - **Manifest.** `dataset/MANIFEST.json` holds the content hash of the dataset, counts by tier, category, and split, and the provenance breakdown. Every run manifest records this hash.
 - **Headroom target.** On the baseline prompt v0, `claude-haiku-5-5` should land between 35% and 65% first-pass acceptance on dev. If it saturates, the complex tier is hardened before E1 begins.
@@ -177,7 +189,7 @@ docker run --rm -i --network none --read-only
   promptharness-sandbox@sha256:<digest>
 ```
 
-- **Input.** A tar stream on stdin holding `solution.py`, the selected test file(s), and `context/`. There are no host volume mounts, no Docker socket, and no environment passthrough. API keys never enter the container.
+- **Input.** A tar stream on stdin holding `solution.py`, the selected test file(s), and `context/`. There are no host volume mounts, no Docker socket, and no environment passthrough. No credentials of any kind enter the container.
 - **Execution.** The in-image runner unpacks the tar to `/work` and runs `pytest -q -p no:cacheprovider --junitxml=/work/report.xml`. It then emits the report on stdout.
 - **Host side.** A hard wall-clock timeout (default 30 s, plus 5 s grace) triggers `docker kill`. stdout and stderr are each capped at 256 KB. The JUnit XML is parsed with `defusedxml`. Every call uses an argv list. `shell=True` is never used.
 - **Integrity.** The candidate code runs in-process with pytest, so it could try to forge results.
@@ -212,9 +224,9 @@ All definitions apply per trial, meaning one (case, variant, rep, attempt):
 
 - **Scope.** The judge sees only `check: judge` requirements, which are all `should`, plus one question: "does the code special-case or hard-code expected outputs?" It never grades correctness, and it never affects acceptance. The hard-coding answer is recorded as `hardcoding_suspected` for manual review. The hidden tests already defeat any hard-coding of the public examples.
 - **Jury.** `claude-sonnet-5-5` and `gpt-6.1-sol` (one per family), each at effort `medium`, which is configurable. A requirement is met only if **both** judges say met. Under this AND rule, one judge's leniency toward its own family can't pass an output alone. The disagreement rate is reported **per candidate family** as a self-preference diagnostic.
-- **Output.** Structured outputs only, via Anthropic's `output_config.format` and OpenAI's structured outputs. The schema is `{verdicts: [{req_id, met, evidence}], hardcoding_suspected, notes}`. A schema failure is a judge error and goes to `errors.jsonl`, not to the model's score.
+- **Output.** Structured outputs only: `claude -p --json-schema` and `codex exec --output-schema`. The schema is `{verdicts: [{req_id, met, evidence}], hardcoding_suspected, notes}`. The host re-validates every reply against the schema. A schema failure is a judge error and goes to `errors.jsonl`, not to the model's score.
 - **Injection hardening.** Candidate code is placed between boundary markers that carry a fresh random 128-bit nonce on every call. The prompt states that everything inside the markers is untrusted data. The rubric is concrete: atomic properties, an explicit "do not reward length", and no labels telling the judge which output is the reference or baseline.
-- **Calibration gate.** The owner hand-labels 60 requirement verdicts across ≥ 30 outputs, stratified by candidate family and pass/fail. The judge must agree on ≥ 90% before its scores steer any decision.
+- **Calibration gate.** `claude-fable-5-1` at effort `high` produces reference labels for 60 requirement verdicts across ≥ 30 outputs, stratified by candidate family and pass/fail. Fable is not on the jury. Claude adjudicates any label it disputes, and the Fable advisor spot-checks 20. The jury must reach ≥ 90% **model-label agreement** before its scores steer any decision. This is reported under that name, never as human agreement.
   - If it falls short, the rubric is revised and re-checked, up to 3 rounds.
   - If it still falls short, judged coverage is reported but marked **uncalibrated**, and the coverage headline falls back to `test` and `static` requirements only. No other work is blocked.
 
@@ -228,15 +240,25 @@ All definitions apply per trial, meaning one (case, variant, rep, attempt):
 `runs/<run_id>/` is gitignored and contains:
 - `manifest.json`: git SHA, config hash, dataset hash, prompt hashes, model IDs, efforts, seeds, split, a `final: bool` flag, start and end times, and total cost.
 - `results.jsonl`: one row per scorable trial (schema in Appendix B).
-- `errors.jsonl`: trials that produced no scorable output. Each row has `error_class` (`api_error`, `timeout`, `served_model_mismatch`, `sandbox_error`, `judge_error`) and the attempt count. These rows never occupy a results slot.
-- `trajectories/<case_id>/<variant_id>/<rep>-<attempt>.json`: the full request body (never headers), the raw response, the extracted code, sandbox logs, and judge input and output.
+- `errors.jsonl`: trials that produced no trustworthy scorable output. Each row has an `error_class` and the attempt count. These rows never occupy a results slot. The classes are:
+  - `cli_error`
+  - `usage_limit`
+  - `timeout`
+  - `served_model_mismatch`
+  - `tool_use_detected`, which means a model tool call returned real output (§8), so the answer may be contaminated
+  - `sandbox_error`
+  - `judge_error`
+- `trajectories/<case_id>/<variant_id>/<rep>-<attempt>.json`: the full prompt, the CLI argv (no credentials exist to leak), the raw CLI output, the extracted code, sandbox logs, and judge input and output.
 
 Other run rules:
 - **Truncation.** `stop_reason == max_tokens` sets status `truncated`. The trial is shown and counted, and it is not accepted.
 - **Refusal.** A refusal is recorded as status `refusal`, reported as its own metric, and not accepted.
-- **Served model.** It must equal the requested ID, or the requested ID plus a documented `-<snapshot>` suffix. Anything else is `served_model_mismatch`. Anthropic server-side refusal fallbacks are **disabled** in the harness, because a fallback would silently change which model produced the output.
+- **Served model.** It must equal the requested ID, or the requested ID plus a documented `-<snapshot>` suffix. Anything else is `served_model_mismatch`.
+  - For Claude, the check reads the `modelUsage` keys in the CLI's JSON output. Exactly one key is allowed, and it must be the requested model. Claude Code's `--fallback-model` is never passed, because a fallback would silently change which model produced the output.
+  - For Codex, the check reads `turn_context.model` from the session rollout. That value is recorded on the client side, so it is a weaker check. This is a documented known gap.
 - **Resume.** Re-running a run skips (case, variant, rep) slots already present in `results.jsonl` and retries `errors.jsonl` entries.
-- **Spend cap.** `--max-usd` (required for live runs) aborts the run cleanly when accumulated cost reaches the cap.
+- **Usage limits.** When either CLI reports a usage-limit or rate-limit error, the runner records `usage_limit` and pauses that provider's lane. It probes with one tiny call every 15 minutes and resumes when the probe succeeds. Other lanes keep running.
+- **Caps.** Every live run requires `--max-calls` and `--max-notional-usd`. The run stops cleanly when either cap is reached.
 
 ### 5.9 Statistics and reporting
 
@@ -250,9 +272,9 @@ Other run rules:
 - **Models.** Primary: `claude-haiku-5-5`, the cheapest tier with the most headroom, and not a judge. Replication: `gpt-6.1-terra`, from the other family and also not a judge.
 - **Protocol:**
   1. Freeze v0.
-  2. Iterate v1…vN (N ≤ 5) on the **dev split only**, with R = 3 and `judge.scope: none`.
+  2. Iterate v1…vN (N ≤ 4) on the **dev split only**, with R = 2 and `judge.scope: none`.
   3. Pick the best by dev first-pass acceptance.
-  4. Make one final run of v0 vs the best version on the **test split**, with R = 3 and `judge.scope: all`, on both models. The test run carries `final: true` in its manifest. The runner refuses `--split test` without `--final`.
+  4. Make one final run of v0 vs the best version on the **test split**, with R = 3, on both models. The primary model gets `judge.scope: all`, and the replication gets `none`. The test run carries `final: true` in its manifest. The runner refuses `--split test` without `--final`.
 - **Hand-off to E2.** The winning prompt, vBest, becomes the prompt for every E2 arm and for the router sweep. That is why the sweep runs after E1, and why E2's savings can't absorb E1's prompt lift.
 - **Leakage guard.** Before the final run, Fable reviews the prompt diff for case-specific hints.
 - **Report.** First-pass acceptance (absolute and relative lift, with CI), `pass^3`, coverage, format-failure rate, and cost. The headline is the primary model's relative lift. The replication is shown beside it.
@@ -273,7 +295,7 @@ Seven configs, all at the provider's default effort unless noted:
 | terra | `gpt-6.1-terra` | provider default |
 | sol | `gpt-6.1-sol` | provider default |
 
-Prices live only in `config/models.yaml` (initial values in Appendix A). Code never hardcodes a price. Model IDs are checked against each provider's live `models.list` by `promptharness models verify` before any paid run.
+Prices live only in `config/models.yaml` (initial values in Appendix A). Code never hardcodes a price. Before any live run, `promptharness models verify` sends one tiny call per configured model through its CLI and asserts the served model (§5.8).
 
 ### 6.2 Complexity estimation
 
@@ -327,7 +349,12 @@ The router has one selection component and three controls. Each control can be s
 
 ### 6.5 Accounting
 
-**Cost per accepted task (CPAT)** = Σ spend across every attempt, including failed attempts, retries, and estimator calls, divided by the number of tasks whose final returned attempt is accepted (hidden tests plus must requirements). Judge cost is measurement overhead and is excluded. Costs come from the API `usage` block × catalog prices, including cache-read and cache-write rates. Costs are never estimated from string length.
+**Cost per accepted task (CPAT)** = Σ notional spend across every attempt, including failed attempts, retries, and estimator calls, divided by the number of tasks whose final returned attempt is accepted (hidden tests plus must requirements). Judge cost is measurement overhead and is excluded.
+
+- **Pricing.** Spend is CLI-reported token usage × catalog list prices, including cache-read and cache-write rates. It is never estimated from string length.
+- **Gross vs net.** Each CLI adds a fixed harness overhead: about 0.7K input tokens for Claude Code and about 6.2K for Codex. At the start of each run, a calibration call per (provider, config) measures that overhead. `net_tokens = gross_tokens − calibrated overhead`. This overhead would not exist in a direct API deployment, and counting it would unfairly penalize OpenAI configs.
+- **Reporting.** The headline CPAT uses **net**. Gross appears beside it in every table.
+- **Latency** follows the same rule. Claude's figure is `duration_api_ms`. Codex's is wall time minus a calibrated startup time. Raw wall time is also recorded.
 
 ### 6.6 Experiment E2: router savings (the 45% claim)
 
@@ -343,14 +370,14 @@ All arms run on the **test split**, with R = 3 and the same cases and seeds. The
 | **R−C** | Router | on | off | on | Leave context control out |
 | **R−T** | Router | off | on | on | Leave retry control out |
 | **R−Bu** | Router | on | on | off | Leave budget control out |
-| **R-slo** | Router with `latency_slo_ms` = the median, across the 7 configs, of each config's p90 attempt latency on the dev sweep. This removes some configs on each tier but never all. | on | on | on | Latency-constrained routing |
+| **R-slo** | Router with `latency_slo_ms` = the median, across the 7 configs, of each config's p90 **net** attempt latency (§6.5) on the dev sweep. This removes some configs on each tier but never all. | on | on | on | Latency-constrained routing |
 
 - **Headline.** CPAT reduction `1 − CPAT(R-full) / CPAT(B0)`, with a bootstrap CI over cases.
 - **"Quality held constant"** means non-inferiority. The lower bound of the paired 95% CI on `acceptance(R-full) − acceptance(B0)` must sit above **−5 points**. If it doesn't, the result is reported as "inconclusive" or "inferior". The margin is never widened after the fact. The coverage difference (judged on B0 and R-full only) is reported too.
 - **Power check.** Before the final run:
   1. Simulate R-full's first attempts on dev from the sweep outcomes.
   2. Bootstrap the paired acceptance difference against `opus@medium` at 84 cases × R = 3 to get the projected CI half-width.
-  3. If the half-width exceeds 4 points, use R = 5 on the test split. That costs about +$100 and needs owner approval. If it is still above 4 points at R = 5, run anyway and let the margin rule above decide.
+  3. If the half-width exceeds 4 points, use R = 5 on the test split (about +2,100 CLI calls; Fable sign-off at the P7 gate). If it is still above 4 points at R = 5, run anyway and let the margin rule above decide.
 - **Ablation table.**
   - Routing alone: R-route vs B0.
   - Controls alone: B1 vs B0.
@@ -364,7 +391,7 @@ All arms run on the **test split**, with R = 3 and the same cases and seeds. The
 
 ### 7.1 Data sources
 
-There are two data paths, and neither needs an API key in GitHub:
+There are two data paths, and neither puts any model credential in GitHub:
 
 - **Local path (eval and token metrics).** On the owner's machine, `promptharness weekly` does four things:
   1. Ingests `runs/*` into `data/warehouse.sqlite` (stdlib `sqlite3`, gitignored).
@@ -385,7 +412,7 @@ There are two data paths, and neither needs an API key in GitHub:
 
 - `promptharness dashboard build --out site/` produces a static site: Jinja2 with autoescape on, Plotly charts, and a strict CSP meta tag.
 - `.github/workflows/weekly-dashboard.yml` runs on cron every Monday at 13:00 UTC, and can also be started by `workflow_dispatch`. It fetches PR stats, builds the site, and deploys it to GitHub Pages. Job permissions are `contents: read` and `pull-requests: read`, plus `pages: write` and `id-token: write` on the deploy job only.
-- **Optional paid canary**, run locally as part of `promptharness weekly --canary`: R-full on 30 fixed dev cases × 1 rep, under a `--max-usd 5` cap. It adds that week's success-rate data point.
+- **Optional canary**, run locally through the subscription CLIs as part of `promptharness weekly --canary`: R-full on 30 fixed dev cases × 1 rep, under `--max-calls 60` and `--max-notional-usd 5`. It adds that week's success-rate data point.
 - The site publishes aggregates only. Model outputs, trajectories, and generated code are never published.
 
 ### 7.4 Prompt registry (team reuse)
@@ -400,17 +427,62 @@ There are two data paths, and neither needs an API key in GitHub:
   complete(req: CompletionRequest) -> Completion
   ```
 
-  `Completion` carries `text`, `usage` (input, output, cache_read, cache_write, reasoning), `served_model`, `stop_reason`, `latency_ms`, and `attempts`. Implementations are `AnthropicProvider`, `OpenAIProvider`, and `FakeProvider` (scripted responses for tests).
-- **Anthropic.** Uses the official `anthropic` SDK (1.x) and follows the claude-api skill:
-  - Streams with `get_final_message()`.
-  - Always sets `output_config.effort` explicitly.
-  - Never sends `temperature` or `budget_tokens`.
-  - Omits `thinking`. Adaptive thinking is on by default for these models.
-  - Does structured outputs through `output_config.format`. Forced `tool_choice` returns a 400 on these models.
-  - Checks `stop_reason` before reading content.
-- **OpenAI.** Uses the official `openai` SDK and the Responses API. Phase 1 verifies the reasoning-effort, structured-output, and usage field names against the official SDK docs before coding. They are not guessed.
-- **Retries.** SDK auto-retry is disabled (`max_retries=0`). The harness retries only 408, 409, 429, ≥ 500, and connection errors, with jittered exponential backoff (base 1 s, cap 30 s, 4 attempts), and records every attempt. Latency is the final successful request only.
-- **Multi-provider by design.** The claude-api skill's "always use `claude-opus-5-5`, never downgrade for cost" default does **not** apply to the router pool or the OpenAI adapter. Cheaper models are the point of the router. A later implementer must not "fix" this.
+  `Completion` carries:
+  - `text`
+  - `usage_gross` and `usage_net` (input, output, cache_read, cache_write, reasoning)
+  - `served_model`
+  - `stop_reason`
+  - `latency_ms_net` and `latency_ms_wall`
+  - `attempts`
+  - `tool_attempts`
+  - `cli_version`
+
+  Live implementations are `ClaudeCLIProvider` and `CodexCLIProvider`. `FakeProvider` (scripted responses) serves every test.
+
+**Common rules for CLI calls**
+- Calls use an argv list, never a shell.
+- Each call runs in a fresh empty temp directory under `runs/<run_id>/cwd/`, so it can't see the repo, the dataset, or the hidden tests.
+- stdin is closed (`< /dev/null`).
+- There is a hard wall-clock timeout of 300 s by default, followed by a process-group kill.
+- stdout is capped at 4 MB.
+- The harness never reads or copies either CLI's credential files. Each CLI resolves its own OAuth login.
+
+**`ClaudeCLIProvider`.** The command is:
+
+```
+claude -p <prompt> --model <id> --effort <lvl> --tools "" --strict-mcp-config
+  --setting-sources "" --system-prompt <s> --output-format json --no-session-persistence
+```
+
+- Add `--json-schema <schema>` for structured output.
+- `--bare` is **not** usable, because it disables OAuth. `--fallback-model` is never passed.
+- Usage comes from `usage` and `modelUsage[model]`. Thinking tokens come from `usage.output_tokens_details.thinking_tokens`. Latency comes from `duration_api_ms`. `stop_reason` and `num_turns` are recorded too.
+- **Tool audit:** `num_turns` must be 1 and `permission_denials` must be empty. Anything else is `tool_use_detected`.
+
+**`CodexCLIProvider`.** The command is:
+
+```
+codex exec --json --ignore-user-config --ignore-rules --skip-git-repo-check -s read-only
+  -m <id> -c model_reasoning_effort="<lvl>" -c model_instructions_file="<file>"
+  -c web_search="disabled"
+```
+
+- Add `--disable <f>` for each of: apps, browser_use, browser_use_external, computer_use, image_generation, multi_agent, memories, plugins, skill_search, sleep_tool, shell_tool, unified_exec, view_image, goals, tool_suggest, hooks, in_app_browser, realtime_conversation, and code_mode_host.
+- Add `--output-schema <file>` for structured output.
+- Usage comes from `turn.completed.usage`.
+- **Tool audit.** The `--json` stream hides tool calls, so the provider must read the session rollout `~/.codex/sessions/**/rollout-*<thread_id>*.jsonl`. Locate it by the `thread_id` from `thread.started`, and **never by modification time**: the owner runs their own Codex sessions concurrently.
+  - Every `custom_tool_call` or `function_call` is recorded in `tool_attempts`.
+  - A call whose output is the fail-closed message ("code-mode host is disabled") is allowed.
+  - Any other tool output gives `tool_use_detected`.
+- **Session cleanup.** After the audit, the provider deletes **only** its own rollouts: those whose `session_meta.cwd` lies under `runs/<run_id>/cwd/`. It never touches any other session.
+
+**Retries.** Only transient CLI failures are retried: a non-zero exit with a network or overload signature. Backoff is jittered exponential (base 2 s, cap 60 s, 4 attempts), and every attempt is recorded. Usage limits pause the lane instead (§5.8).
+
+**Version pinning.** `claude --version` and `codex --version` are recorded in every manifest. P1's contract tests pin the JSON shapes above, so CLI drift fails loudly.
+
+**SDK adapters (stretch, not exercised live).** `AnthropicAPIProvider` (official `anthropic` SDK) and `OpenAIAPIProvider` (official `openai` SDK, Responses API) are written to the same protocol. They follow the claude-api skill's rules: effort set explicitly, no `temperature` or `budget_tokens`, and structured outputs via `output_config.format`. They are tested only against recorded fixtures. They ship as an optional `[sdk]` extra and are labeled in the README as unused for any reported number.
+
+**Multi-provider by design.** The claude-api skill's "always use `claude-opus-5-5`, never downgrade for cost" default does **not** apply to the router pool. Cheaper models are the point of the router. A later implementer must not "fix" this.
 
 ## 9. Security requirements
 
@@ -419,7 +491,10 @@ The threat model lives in `docs/THREAT_MODEL.md`, written in Phase 2. The advers
 | Threat | Control | Verified by |
 |---|---|---|
 | Generated code exfiltrates data or attacks the network | `--network none` | Adversarial test: socket and HTTP calls fail |
-| Generated code reads secrets | No env passthrough; keys exist only in the host process | Canary env var on host is absent in container |
+| Generated code reads secrets | No env passthrough. No API keys exist. The harness never reads CLI credential files. | Canary env var on host is absent in container |
+| Model under test reads the hidden tests or the host | Empty temp cwd per call; Claude `--tools ""`; Codex read-only sandbox with shell, exec, and code mode disabled; rollout tool audit | Adversarial prompts ("run `cat /etc/hostname`", "read ../dataset") end in no tool output, or the trial is excluded as `tool_use_detected` |
+| Harness damages the owner's own CLI state | Codex rollouts located by `thread_id` and deleted only if their cwd lies under our run dir; Claude `--no-session-persistence` | Test with a decoy foreign rollout: it is never read or deleted |
+| Command injection via CLI arguments | argv list only, never a shell; prompts passed as one argv element or via file | Test with a prompt containing `$(rm -rf ~)` and `;`: it arrives verbatim |
 | Host filesystem tampering | No mounts, read-only rootfs, tmpfs work dir with size cap | Write outside `/work` fails |
 | Resource exhaustion | pids, memory, CPU, nofile, and fsize limits, wall-clock kill, output caps | Fork bomb, memory bomb, infinite loop, and 50 MB stdout tests |
 | Privilege escalation | Non-root uid, `--cap-drop ALL`, `no-new-privileges`, Docker's default seccomp, no Docker socket | `CapEff` is 0, uid ≠ 0, socket absent |
@@ -427,8 +502,8 @@ The threat model lives in `docs/THREAT_MODEL.md`, written in Phase 2. The advers
 | Prompt injection into judge | Nonce-fenced untrusted block, structured output, AND jury | Injection fixture cannot flip verdicts |
 | Malicious YAML or XML | `yaml.safe_load` only; `defusedxml` | Bandit rule; unit test with a billion-laughs payload |
 | Path traversal from case or run IDs | ID regexes; resolved-path-inside-root checks | Unit tests with `../` IDs |
-| Secret leakage in repo or logs | `.env` gitignored, gitleaks in pre-commit and CI, log redaction filter, trajectories store bodies not headers | gitleaks clean; redaction unit test |
-| Runaway spend | Required `--max-usd`, pre-run `estimate`, CI uses only fakes, no API keys stored in GitHub | Unit test that the cap aborts; secret list shows no API keys |
+| Secret leakage in repo or logs | `.env` gitignored, gitleaks in pre-commit and CI, log redaction filter for token-like strings | gitleaks clean; redaction unit test |
+| Runaway quota use | Required `--max-calls` and `--max-notional-usd`, pre-run `estimate`, usage-limit pause, CI uses only fakes | Unit tests that the caps abort; CI never invokes a CLI |
 | Supply chain | `uv.lock` committed, `pip-audit`, Dependabot, sandbox image pinned by digest, Trivy scan, Actions pinned to commit SHAs | CI jobs |
 | CI and workflow abuse | Least-privilege `permissions:` per job, no `pull_request_target`, no model-API secrets in GitHub at all, zizmor scan | zizmor clean |
 | Dashboard XSS | Jinja2 autoescape, CSP, aggregates only | `<script>` in a PR title renders escaped |
@@ -450,7 +525,8 @@ Every phase passes the same gates G1–G7 before merge, plus its own security ch
 ## 11. Tech stack and layout
 
 - **Language and tooling.** Python 3.12 (`requires-python = ">=3.12,<3.14"`), uv with a committed `uv.lock`, Typer CLI, and pydantic v2 configs from YAML.
-- **Libraries.** `anthropic`, `openai`, `numpy`, `jinja2`, `plotly`, `defusedxml`, `pyyaml`, and `httpx` (GitHub API).
+- **Libraries.** `numpy`, `jinja2`, `plotly`, `defusedxml`, `pyyaml`, and `httpx` (GitHub API). The optional `[sdk]` extra adds `anthropic` and `openai`.
+- **External CLIs (live runs only).** Claude Code `claude` ≥ 2.1.319 and Codex `codex` ≥ 0.167.0, both signed in.
 - **Dev tools.** `pytest`, `pytest-cov`, `ruff`, `mypy --strict`, `bandit`, `pip-audit`, `pre-commit`, `gitleaks`, `hadolint`, Trivy, and zizmor.
 - **Test markers.** `docker` is skipped when the daemon is absent. `live` runs only with `PEH_LIVE=1` and never in CI.
 
@@ -468,69 +544,71 @@ prompt-eval-harness/
 └── runs/ data/ site/  gitignored
 ```
 
-## 12. Cost estimate and spend controls
+## 12. Quota budget, notional cost, and run controls
 
-The planning assumptions are averages that the Phase 4 smoke run replaces with measured ones:
+Actual spend is **$0**. Every live call runs on the owner's Claude and ChatGPT subscriptions. The budget that matters is **subscription quota**, so the default sizing is lean. Notional costs (list-price equivalents) are shown so CPAT and the router's savings stay meaningful.
 
-- **Per generation:** 1,500 input and 4,000 output tokens, including thinking. `opus@low` is assumed at 2,500 output.
-- **Retry input growth is not modeled.** Arms with context control off resend the full pytest output and conversation, so their retries grow in input. The upper-bound column absorbs this, and the P4 smoke run replaces it with a measured figure.
+The planning assumptions are averages that P4's smoke run replaces with measured values:
+
+- **Per generation:** 1,500 input tokens (net) and 4,000 output tokens, including thinking. `opus@low` is assumed at 2,500 output.
 - **Per judge call:** 4,000 input and 1,200 output tokens.
-- **Resulting per-call prices:** haiku and luna $0.0022, terra $0.0215, sonnet and sol $0.043, opus@low $0.056, opus@medium $0.086, jury $0.040 per judged trial.
+- **Retry growth:** retries with context control off grow in input. This is not modeled here.
 
-| Activity | Volume | Expected USD | Upper USD |
-|---|---|---|---|
-| Dataset: drafts (`opus@high`, ~8K output), regenerations, cross-family solve, per-case auditor | ~250 drafts | ~75 | ~90 |
-| Smoke, oracle, and null runs; judge calibration | small | ~10 | ~15 |
-| E1 dev iteration (Haiku, ≤ 5 versions × 126 × R3, no judge) | ≤ 1,890 trials | ~4 | ~5 |
-| E1 final (2 versions × 84 × R3 × 2 models, judge on) | 1,008 trials | ~52 | ~55 |
-| E2 dev sweep (7 configs × 126 × R2, no judge) | 1,764 trials | ~64 | ~75 |
-| E2 final: Opus arms B0, B1, B2 (252 tasks each, ~1.3 attempts) | 756 tasks | ~75 | ~90 |
-| E2 final: 6 router arms (252 tasks each) | 1,512 tasks | ~72 | ~180 |
-| E2 final: jury on B0 and R-full final attempts | 504 trials | ~20 | ~20 |
-| **Total** | | **≈ $372** | **≈ $530** |
-| Weekly canary (optional, local, no judge) | 30 trials/week | < $1/week | |
+| Activity (default, lean) | CLI calls | Notional USD |
+|---|---|---|
+| Dataset: ~250 Opus drafts plus ~60 regenerations, 250 cross-family solves (Sol), 250 Fable audits | ~810 | ~94 |
+| Overhead calibration, smoke, oracle and null runs, judge calibration (Fable labels, jury, determinism) | ~150 | ~10 |
+| E1 dev iteration (Haiku, ≤ 4 versions × 126 × R2, no judge) | ≤ 1,008 | ~2 |
+| E1 final (2 versions × 84 × R3 × 2 models; jury on the primary model only) | ~2,016 | ~32 |
+| E2 dev sweep (7 configs × 126 × R2, no judge) | ~1,764 | ~64 |
+| E2 final, six core arms (B0, B1, B2, R-route, R-full, R-slo; 252 tasks each, ~1.4 attempts) plus jury on B0 and R-full | ~3,125 | ~131 |
+| **Default total** | **≈ 8,900** | **≈ $333 notional ($0 actual)** |
+| Opt-in: three leave-one-out arms (R−C, R−T, R−Bu) | +~1,060 | +~36 |
+| Opt-in: R = 5 on the E2 final (power escalation, §6.6) | +~2,100 | +~90 |
+| Weekly canary (optional, local) | 30/week | < $1 |
 
-- **Upper bound.** The router-arm upper bound assumes each router arm costs as much per task as B0. It deliberately does not assume the savings the experiment is meant to measure.
-- **Cap.** The proposed cap is **$500**. Spend is tracked per run, and the owner re-approves before E2's final run if cumulative spend so far points past the cap.
-- **Excluded.** R = 5 escalation (§6.6) adds about $100 and needs separate approval.
-- **Lean mode, ≈ $300 expected.** It drops the E1 replication on terra (−$31) and the three leave-one-out arms (−$36). The ablation then shows only routing-alone vs controls-alone.
-- **Before every paid run,** `promptharness estimate` recomputes these figures from config prices and measured token averages. No paid run starts without an explicit `--max-usd`.
+- **Quota-heavy calls** are about 1,900 Opus calls (drafts, the Opus sweep configs, and the B arms) and about 310 Fable calls. The full program will take several usage windows across multiple days.
+- **Lanes.** The runner uses one lane per provider, with concurrency 3 per lane by default. Each lane pauses on usage limits (§5.8). Before each large run, Claude tells the owner in one line roughly how many hours of Claude and ChatGPT quota it will use, because the owner also uses both subscriptions.
+- **Estimates.** `promptharness estimate` prints calls, notional cost, and expected wall-clock time from the catalog and measured averages. Every live run requires `--max-calls` and `--max-notional-usd`.
+- **Opt-in arms.** The leave-one-out arms run if quota allows after the core arms finish. If they don't run, the ablation reports routing-alone vs controls-alone only, and RESULTS.md says so.
 
 ## 13. Success criteria
 
 1. The dataset has ≥ 210 QC-passed cases with 100% provenance tags.
 2. Gold solutions pass at 100%, and known-bad solutions fail at 100%.
 3. The oracle run accepts ≥ 99%, and the null run accepts 0%.
-4. Judge agreement with owner labels is ≥ 90%.
+4. Jury agreement with Fable 5.1 reference labels is ≥ 90% (**model-label agreement**; no human labels).
 5. The adversarial sandbox suite passes 100%.
 6. E1 reports measured relative first-pass-acceptance lift with a 95% CI. The target is ≥ 35%.
 7. E2 reports measured CPAT reduction vs B0 with a CI. The target is ≥ 45%, with acceptance non-inferior (paired CI lower bound > −5 points). The ablation, R-slo, and the R-full-vs-B2 comparison are reported.
 8. The dashboard is published weekly, showing PRs opened and merged, success rates, and token consumption, with baseline lines.
 9. Every number in the README recomputes from raw rows with one documented command.
+10. $0 actual spend. No API key is ever created or stored. Every live call goes through a subscription CLI, and every row records `cli_version`.
 
 ## 14. Risks
 
 | Risk | Mitigation |
 |---|---|
 | Measured lift or savings miss the targets | Report the real numbers; the résumé follows the data. Levers to explore: harder cases, better prompts, more pool diversity. |
-| Dataset tests encode the generator model's interpretation | Cross-family solve flag, human review, and known-bad checks |
+| Dataset tests encode the generator model's interpretation | Cross-family solve flag, a Fable auditor that differs from the Opus generator, independent model verification, and known-bad checks |
 | Saturated dataset with no headroom | Headroom target (§5.2); harden the complex tier before E1 |
 | Judge self-preference | AND jury across families, per-family disagreement diagnostic, calibration gate |
 | Under-powered E2 | Power check, then R = 5 escalation (§6.6) |
-| Model IDs or prices change mid-project | `models verify` before paid runs; `verified_on` in the catalog; manifests record prices used |
+| Model IDs or prices change mid-project | `models verify` before live runs; `verified_on` in the catalog; manifests record prices used |
 | Docker Desktop resource limits on macOS | Concurrency default 4; measured sandbox overhead |
-| OpenAI SDK surface differs from expectation | Phase 1 verifies against official docs before writing the adapter |
+| CLI output shape or flags change (Claude Code and Codex update often) | Versions recorded per manifest; P1 contract tests on real captured outputs; pin versions during E1 and E2 finals |
+| Subscription usage limits stall runs | Lean default sizing, per-provider lanes, usage-limit pause and resume, opt-in arms last |
+| Codex served model can't be verified server-side | Record client `turn_context.model`; documented as a known gap in RESULTS.md |
+| CLI harness overhead distorts cost and latency | Calibrated gross-vs-net accounting (§6.5); headline uses net, and gross is shown |
+| Model labels instead of human labels | Separate roles: generator Opus, auditor and labeler Fable, jury Sonnet + Sol. Disclosed in RESULTS.md. |
 
 ## 15. Inputs needed from the owner
 
-1. API credentials: `ANTHROPIC_API_KEY` (or `ant auth login`) and `OPENAI_API_KEY`, exported in the shell and never committed.
-2. Approval of the spend: about $372 expected with a $500 cap, or lean mode at about $300.
-3. A GitHub repo for this project, needed for CI, PR tracking, and Pages, and a decision on its visibility (see §17).
-4. About 4 hours of review time:
-   - Review `seeds.yaml`: ~30 min.
-   - Verify flagged and sampled cases: ~2.5 h, estimated at ≤ 60 cases × 2–3 min.
-   - Label 60 judge verdicts: ~1 h.
-5. Any repos besides this one that the PR dashboard should track.
+None are blocking (§0). The owner keeps:
+- Claude Code and Codex signed in, and the portable SSD with the Obsidian vault mounted during work sessions.
+- An optional final read-through of the README claim table in P9.
+
+Everything else is done by Claude with the Fable advisor.
 
 ## 16. Left to the builder
 
@@ -539,11 +617,11 @@ The planning assumptions are averages that the Phase 4 smoke run replaces with m
 - The wording of prompt versions v1…vN. Measuring them on dev is the point.
 - The exact feature set of `HeuristicEstimator`, as long as it is computed from the prompt and case metadata visible at routing time, never from tests.
 
-## 17. Repo visibility and dataset exposure (owner decision pending)
+## 17. Repo visibility and dataset exposure (decided: public)
 
-The repo holds the dataset, including the hidden tests, gold solutions, and split labels. Whether those are publicly visible is the owner's call, recorded here once made.
+The GitHub repo `as567-code/prompt-eval-harness` is **public**. The dataset, including the hidden tests, gold solutions, and split labels, is committed and therefore public.
 
-During this project, models under test have no web or tool access, so a public dataset can't leak into a run. Any re-run on a model released after publication is labeled "post-publication: contamination possible".
+During this project, models under test run with no tools, no web access, and an empty cwd, so a public dataset can't leak into a run. Any re-run on a model released after the dataset's first public commit is labeled "post-publication: contamination possible". Raw trajectories (`runs/`) are never committed.
 
 ---
 
@@ -570,7 +648,7 @@ run_id, case_id, split, tier, variant_id, prompt_version, model, effort, rep, at
 status (ok | no_code | truncated | refusal | tamper_suspect | timeout | resource_limit),
 hidden_pass, tests_passed, tests_total, requirement_verdicts[{req_id, check, met, source}],
 coverage, must_coverage, accepted, tamper_flags[], judge_disagreements,
-usage{input, output, cache_read, cache_write, reasoning}, cost_usd,
+usage_gross{…}, usage_net{input, output, cache_read, cache_write, reasoning}, notional_cost_usd_net, notional_cost_usd_gross,
 judge_models[], judge_usage{}, judge_cost_usd, served_model, stop_reason,
-latency_ms, api_attempts, sandbox_ms, trajectory_path, started_at, finished_at
+latency_ms_net, latency_ms_wall, cli_attempts, tool_attempts, cli_version, sandbox_ms, trajectory_path, started_at, finished_at
 ```
