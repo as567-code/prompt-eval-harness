@@ -122,3 +122,60 @@ def test_cwd_is_respected(tmp_path: Path) -> None:
     result = run_cli([str(script)], cwd=work, timeout_s=20)
     assert result.stdout.strip() == str(work.resolve())
     assert os.path.isdir(work)
+
+
+def test_both_streams_heavy_no_deadlock(tmp_path: Path) -> None:
+    script = _script(
+        tmp_path,
+        """
+        import sys
+        for _ in range(60):
+            sys.stdout.write("o" * 100_000)
+            sys.stderr.write("e" * 100_000)
+        """,
+    )
+    result = run_cli([str(script)], cwd=tmp_path, timeout_s=30)
+    assert result.returncode == 0
+    assert result.truncated
+    assert len(result.stdout) == 4_000_000
+    assert result.stderr
+
+
+def test_escaped_session_pipe_holder_does_not_hang(tmp_path: Path) -> None:
+    script = _script(
+        tmp_path,
+        """
+        import subprocess, sys
+        subprocess.Popen(["sleep", "6062"], start_new_session=True,
+                         stdout=sys.stdout, stderr=sys.stderr)
+        print("ok", flush=True)
+        """,
+    )
+    try:
+        start = time.monotonic()
+        result = run_cli([str(script)], cwd=tmp_path, timeout_s=10)
+        assert time.monotonic() - start < 5
+        assert result.returncode == 0
+        assert "ok" in result.stdout
+        assert result.truncated is True
+    finally:
+        subprocess.run(["pkill", "-f", "sleep 6062"], check=False)  # noqa: S607
+
+
+def test_normal_exit_kills_leftover_group_members(tmp_path: Path) -> None:
+    script = _script(
+        tmp_path,
+        """
+        import subprocess
+        subprocess.Popen(["sleep", "6063"], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+        """,
+    )
+    result = run_cli([str(script)], cwd=tmp_path, timeout_s=10)
+    assert result.returncode == 0
+    deadline = time.monotonic() + 3
+    survivors = _pgrep("sleep 6063")
+    while survivors and time.monotonic() < deadline:
+        time.sleep(0.1)
+        survivors = _pgrep("sleep 6063")
+    assert survivors == []
