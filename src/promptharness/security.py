@@ -7,6 +7,7 @@ import os
 import re
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -102,8 +103,30 @@ class RedactingFilter(logging.Filter):
         return True
 
 
+def _install_record_factory() -> None:
+    """Wrap the global LogRecord factory so every record is redacted at creation."""
+    current = logging.getLogRecordFactory()
+    if getattr(current, "_peh_redacting", False):
+        return
+
+    def factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
+        record = current(*args, **kwargs)
+        record.msg = _redact(record.getMessage())
+        record.args = None
+        return record
+
+    factory._peh_redacting = True  # type: ignore[attr-defined]
+    logging.setLogRecordFactory(factory)
+
+
 def install_redaction(logger: logging.Logger | None = None) -> None:
-    """Attach a ``RedactingFilter`` to ``logger`` (root by default), once."""
-    target = logger if logger is not None else logging.getLogger()
-    if not any(isinstance(f, RedactingFilter) for f in target.filters):
-        target.addFilter(RedactingFilter())
+    """Redact secrets in log records.
+
+    With a ``logger``, attach a ``RedactingFilter`` to it (once). With no argument,
+    wrap the global record factory (once) so records from every logger, including
+    child loggers and third-party libraries, are redacted.
+    """
+    if logger is None:
+        _install_record_factory()
+    elif not any(isinstance(f, RedactingFilter) for f in logger.filters):
+        logger.addFilter(RedactingFilter())

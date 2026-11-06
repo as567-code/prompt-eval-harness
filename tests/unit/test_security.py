@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -96,13 +97,38 @@ def test_redaction(caplog: pytest.LogCaptureFixture) -> None:
     assert second == "arg sk-***"
 
 
-def test_install_redaction_idempotent_and_default() -> None:
+def test_install_redaction_idempotent_per_logger() -> None:
     logger = logging.getLogger("peh.redact.idem")
     install_redaction(logger)
     install_redaction(logger)
     assert sum(isinstance(f, RedactingFilter) for f in logger.filters) == 1
+
+
+@pytest.fixture
+def restore_factory() -> Iterator[None]:
+    original = logging.getLogRecordFactory()
+    try:
+        yield
+    finally:
+        logging.setLogRecordFactory(original)
+
+
+def test_redaction_covers_child_loggers(
+    restore_factory: None, caplog: pytest.LogCaptureFixture
+) -> None:
     install_redaction()
-    root = logging.getLogger()
-    assert any(isinstance(f, RedactingFilter) for f in root.filters)
-    for f in [f for f in root.filters if isinstance(f, RedactingFilter)]:
-        root.removeFilter(f)
+    wrapped = logging.getLogRecordFactory()
+    install_redaction()
+    assert logging.getLogRecordFactory() is wrapped  # idempotent
+    with caplog.at_level(logging.INFO):
+        logging.getLogger("some.child.lib").info(
+            "tok ghp_abcdefghijklmnopqrstuv key sk-ant-api03-AbC_123xyz %s", "Bearer eyJabc"
+        )
+        logging.getLogger("some.child.lib").info("task-force ready")
+    msgs = [r.getMessage() for r in caplog.records]
+    for secret in ("abcdefghijklmnopqrstuv", "AbC_123xyz", "eyJabc"):
+        assert secret not in msgs[0]
+    assert "ghp_***" in msgs[0]
+    assert "sk-***" in msgs[0]
+    assert "Bearer ***" in msgs[0]
+    assert msgs[1] == "task-force ready"
