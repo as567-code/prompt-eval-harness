@@ -9,6 +9,8 @@ from promptharness.security import (
     ConfigError,
     PathEscapeError,
     RedactingFilter,
+    _redact,
+    _redact_record,
     install_redaction,
     load_yaml,
     safe_env,
@@ -166,3 +168,47 @@ def test_redaction_covers_exception_text(restore_factory: None) -> None:
     assert "boom" in out
     assert "ValueError" in out
     assert "SECRETxyz" not in out
+
+
+def test_factory_survives_bad_format_args(
+    restore_factory: None, caplog: pytest.LogCaptureFixture
+) -> None:
+    install_redaction()
+    with caplog.at_level(logging.WARNING):
+        logging.getLogger("x.bad").warning("%s %s sk-ant-api03-SECRETabc", 1)
+    assert caplog.records
+    assert "SECRETabc" not in caplog.text
+    assert "SECRETabc" not in caplog.records[0].getMessage()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "GH_TOKEN=abc123",
+        "MY_SECRET=x",
+        "OPENAI_API_KEY=abc",
+        '{"api_key": "abc"}',
+        "password: 'p w'",
+    ],
+)
+def test_generic_pattern_redacts_env_and_json_forms(text: str) -> None:
+    out = _redact(text)
+    assert "abc" not in out.replace("api_key", "")
+    assert "=***" in out
+    assert "abc123" not in out
+    assert "=x" not in out
+
+
+@pytest.mark.parametrize(
+    "text", ["task-force", "output_tokens=64", "max_output_tokens=64", "input_tokens: 5"]
+)
+def test_generic_pattern_leaves_non_secrets(text: str) -> None:
+    assert _redact(text) == text
+
+
+def test_redact_record_redacts_stack_info() -> None:
+    record = logging.LogRecord("n", logging.INFO, __file__, 1, "m", None, None)
+    record.stack_info = "Stack:\n  token sk-ant-api03-SECRETstk"
+    _redact_record(record)
+    assert record.stack_info is not None
+    assert "SECRETstk" not in record.stack_info

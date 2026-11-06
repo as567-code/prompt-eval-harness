@@ -36,7 +36,13 @@ _REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"), "github_pat_***"),
     (re.compile(r"\bsk-[A-Za-z0-9_-]{3,}"), "sk-***"),
     (re.compile(r"\b(gh[pousr])_[A-Za-z0-9]{16,}"), r"\1_***"),
-    (re.compile(r"(?i)\b(api[_-]?key|token|secret|password)\s*[=:]\s*\S+"), r"\1=***"),
+    (
+        re.compile(
+            r"(?i)(?<![A-Za-z0-9])([A-Za-z0-9_]*(?:api[_-]?key|token|secret|password))"
+            r"[\"']?\s*[=:]\s*(?:\"[^\"]*\"|'[^']*'|\S+)"
+        ),
+        r"\1=***",
+    ),
 )
 
 
@@ -98,7 +104,13 @@ def _redact(text: str) -> str:
 
 def _redact_record(record: logging.LogRecord) -> None:
     """Redact message, exception text and stack info of ``record`` in place."""
-    record.msg = _redact(record.getMessage())
+    try:
+        rendered = record.getMessage()
+    except Exception:  # bad format args must never break the caller
+        rendered = str(record.msg)
+        if record.args:
+            rendered += " " + repr(record.args)
+    record.msg = _redact(rendered)
     record.args = None
     if record.exc_info:
         record.exc_text = logging.Formatter().formatException(record.exc_info)
