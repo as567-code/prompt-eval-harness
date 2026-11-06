@@ -1,0 +1,12 @@
+.env
+.venv/
+runs/
+data/
+site/
+__pycache__/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.DS_Store
