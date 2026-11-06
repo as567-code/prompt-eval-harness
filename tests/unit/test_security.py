@@ -64,10 +64,40 @@ def test_safe_join_blocks_escape(tmp_path: Path) -> None:
         safe_join(tmp_path, "..", "etc")
 
 
+@pytest.mark.parametrize("parts", [(".",), ("",), ("a", "..")])
+def test_safe_join_rejects_root_itself(tmp_path: Path, parts: tuple[str, ...]) -> None:
+    with pytest.raises(PathEscapeError):
+        safe_join(tmp_path, *parts)
+
+
 def test_safe_join_blocks_symlink_escape(tmp_path: Path) -> None:
     (tmp_path / "link").symlink_to("/etc")
     with pytest.raises(PathEscapeError):
         safe_join(tmp_path, "link", "passwd")
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "ANTHROPIC_BASE_URL",
+        "OPENAI_BASE_URL",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_FOUNDRY",
+        "AWS_BEARER_TOKEN_BEDROCK",
+        "AWS_ACCESS_KEY_ID",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "NODE_OPTIONS",
+    ],
+)
+def test_safe_env_extra_fails_closed(key: str) -> None:
+    assert key not in safe_env({key: "x"})
+
+
+def test_safe_env_extra_keeps_allowlisted() -> None:
+    env = safe_env({"CLAUDE_CODE_MAX_OUTPUT_TOKENS": "64", "HOME": "/x"})
+    assert env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "64"
+    assert env["HOME"] == "/x"
 
 
 def test_safe_env_strips_keys(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -233,3 +263,21 @@ def test_generic_pattern_handles_escaped_quotes() -> None:
 def test_generic_pattern_long_key_prefix() -> None:
     out = _redact("A" * 100 + "_TOKEN=supersecret")
     assert "supersecret" not in out
+
+
+class _Unrenderable:
+    def __str__(self) -> str:
+        raise RuntimeError("no str")
+
+    def __repr__(self) -> str:
+        raise RuntimeError("no repr")
+
+
+def test_redact_record_unrenderable_message_never_raises() -> None:
+    record = logging.LogRecord("n", logging.INFO, __file__, 1, _Unrenderable(), None, None)
+    _redact_record(record)
+    assert record.msg == "<unrenderable log message>"
+    record = logging.LogRecord("n", logging.INFO, __file__, 1, "%s %s", (_Unrenderable(),), None)
+    _redact_record(record)
+    assert record.msg == "<unrenderable log message>"
+    assert record.args is None

@@ -29,7 +29,12 @@ _ENV_ALLOWLIST = (
     "CODEX_HOME",
     "CLAUDE_CONFIG_DIR",
 )
-_SECRET_KEY_RE = re.compile(r"(?i)(API_KEY|AUTH_TOKEN|SECRET|_TOKEN$|PASSWORD)")
+# Keys a caller may add through ``safe_env(extra=...)`` beyond the inherited allowlist.
+_EXTRA_ALLOWLIST = frozenset({"CLAUDE_CODE_MAX_OUTPUT_TOKENS"})
+_SECRET_KEY_RE = re.compile(
+    r"(?i)(API[_-]?KEY|AUTH_TOKEN|SECRET|PASSWORD|CREDENTIAL|(?:^|_)TOKEN(?:_|$)"
+    r"|_BASE_URL$|^CLAUDE_CODE_USE_|^(AWS|GOOGLE|AZURE|CLOUDSDK)_|^NODE_OPTIONS$)"
+)
 
 _REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"(?i)\bBearer\s+\S+"), "Bearer ***"),
@@ -84,7 +89,7 @@ def safe_join(root: Path, *parts: str) -> Path:
     """Join ``parts`` under ``root``, rejecting lexical or symlink escapes."""
     resolved_root = root.resolve()
     candidate = Path(resolved_root, *parts).resolve()
-    if not candidate.is_relative_to(resolved_root):
+    if candidate == resolved_root or not candidate.is_relative_to(resolved_root):
         raise PathEscapeError(f"path {candidate} escapes root {resolved_root}")
     return candidate
 
@@ -93,7 +98,8 @@ def safe_env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
     """Build a child-process env from an allowlist, never including secrets."""
     env = {k: os.environ[k] for k in _ENV_ALLOWLIST if k in os.environ}
     if extra:
-        env.update(extra)
+        permitted = set(_ENV_ALLOWLIST) | _EXTRA_ALLOWLIST
+        env.update({k: v for k, v in extra.items() if k in permitted})
     return {k: v for k, v in env.items() if not _SECRET_KEY_RE.search(k)}
 
 
@@ -108,9 +114,12 @@ def _redact_record(record: logging.LogRecord) -> None:
     try:
         rendered = record.getMessage()
     except Exception:  # bad format args must never break the caller
-        rendered = str(record.msg)
-        if record.args:
-            rendered += " " + repr(record.args)
+        try:
+            rendered = str(record.msg)
+            if record.args:
+                rendered += " " + repr(record.args)
+        except Exception:  # str()/repr() of hostile objects can raise too
+            rendered = "<unrenderable log message>"
     record.msg = _redact(rendered)
     record.args = None
     if record.exc_info:

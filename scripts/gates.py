@@ -35,8 +35,15 @@ RULES: tuple[Rule, ...] = (
     Rule("no-eval-exec", re.compile(r"\beval\(|\bexec\("), ("src/**/*.py",)),
     Rule(
         "no-cli-in-ci",
-        re.compile(r"claude |codex |ANTHROPIC_|OPENAI_"),
-        (".github/workflows/*.yml", ".github/workflows/*.yaml"),
+        re.compile(
+            r"(?i)\b(claude|codex)\b|anthropic|openai|CLAUDE_CODE_|secrets\.(?!GITHUB_TOKEN\b)"
+        ),
+        (
+            ".github/workflows/*.yml",
+            ".github/workflows/*.yaml",
+            ".github/actions/**/action.yml",
+            ".github/actions/**/action.yaml",
+        ),
     ),
     Rule(
         "no-bare-or-fallback",

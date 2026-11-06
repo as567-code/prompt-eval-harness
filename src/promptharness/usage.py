@@ -7,7 +7,13 @@ from dataclasses import dataclass, replace
 
 @dataclass(frozen=True)
 class Usage:
-    """Token counts for one model call. ``reasoning`` is a subset of ``output``."""
+    """Token counts for one model call.
+
+    The buckets are disjoint: ``input`` EXCLUDES the ``cache_read`` and cache-write
+    tokens, and ``reasoning`` is a subset of ``output``. Parsers must subtract cached
+    tokens from providers that include them (Codex ``input_tokens`` includes
+    ``cached_input_tokens``).
+    """
 
     input: int = 0
     output: int = 0

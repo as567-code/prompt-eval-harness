@@ -3,6 +3,7 @@
 import typer
 
 from promptharness import __version__
+from promptharness.security import install_redaction
 
 app = typer.Typer(help="Prompt-evaluation harness and model router.", no_args_is_help=True)
 
@@ -24,3 +25,4 @@ def main(
     ),
 ) -> None:
     """Prompt-evaluation harness and model router."""
+    install_redaction()

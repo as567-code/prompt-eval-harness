@@ -41,6 +41,22 @@ CASES = [
     ("no-cli-in-ci", ".github/workflows/ci.yml", "      - run: codex exec hi\n"),
     ("no-cli-in-ci", ".github/workflows/ci.yml", "  ANTHROPIC_" + "KEY: x\n"),
     ("no-cli-in-ci", ".github/workflows/ci.yml", "  OPENAI_" + "KEY: x\n"),
+    (
+        "no-cli-in-ci",
+        ".github/workflows/ci.yml",
+        "      - uses: anthropics/claude-code-action@abc\n",
+    ),
+    ("no-cli-in-ci", ".github/workflows/ci.yml", "      - uses: openai/codex-action@abc\n"),
+    ("no-cli-in-ci", ".github/workflows/ci.yml", "      - run: npx @anthropic-ai/claude-code\n"),
+    ("no-cli-in-ci", ".github/workflows/ci.yml", "      - run: claude\n"),
+    ("no-cli-in-ci", ".github/workflows/ci.yml", "  CLAUDE_CODE_OAUTH_" + "TOKEN: x\n"),
+    ("no-cli-in-ci", ".github/workflows/ci.yml", "  K: ${{ secrets.FOO }}\n"),
+    (
+        "no-cli-in-ci",
+        ".github/actions/x/action.yml",
+        "runs: {using: composite, steps: [{run: claude -p}]}\n",
+    ),
+    ("no-cli-in-ci", ".github/actions/x/action.yaml", "  K: ${{ secrets.FOO }}\n"),
     ("no-bare-or-fallback", "src/mod.py", 'args = ["--bare"]\n'),
     ("no-bare-or-fallback", "src/mod.py", 'args = ["--fallback-model"]\n'),
     ("no-credential-read", "src/mod.py", 'p = home / "auth.json"\n'),
@@ -75,3 +91,10 @@ def test_gates_clean_tree_exits_zero(tmp_path: Path) -> None:
     result = run_gates(tmp_path)
     assert result.returncode == 0
     assert result.stdout == ""
+
+
+def test_gates_allows_github_token_secret(tmp_path: Path) -> None:
+    wf = tmp_path / ".github" / "workflows" / "ci.yml"
+    wf.parent.mkdir(parents=True)
+    wf.write_text("  T: ${{ secrets.GITHUB_TOKEN }}\n")
+    assert run_gates(tmp_path).returncode == 0
