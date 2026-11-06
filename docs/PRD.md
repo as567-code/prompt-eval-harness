@@ -301,7 +301,9 @@ Prices live only in `config/models.yaml` (initial values in Appendix A). Code ne
 
 The router has one selection component and three controls. Each control can be switched on or off independently, which is what lets E2 ablate it. After every attempt, the router runs the **public** tests in the sandbox. It never runs the hidden ones. Every arm makes at most **3 attempts** per task.
 
-- **Routing (R).** This is selection. The initial config is the head of the estimated tier's ladder. When a request carries `latency_slo_ms`, configs whose p90 exceeds it are dropped first. If none remain, the fastest config is used.
+- **Routing (R).** This is selection. The initial config is the head of the estimated tier's ladder.
+  - When a request carries `latency_slo_ms`, configs whose p90 attempt latency on that tier exceeds it are dropped from the ladder first. If that would leave the ladder empty, the single fastest config is kept.
+  - If every rung that meets the SLO fails, the task continues on the unfiltered ladder and is recorded as `slo_unmet`. Quality wins over latency.
   - *Without R:* B arms always use one fixed config.
 - **Retry control (T).**
   - Retry only on actionable failures: public-test failure or `no_code`.
@@ -341,7 +343,7 @@ All arms run on the **test split**, with R = 3 and the same cases and seeds. The
 | **R−C** | Router | on | off | on | Leave context control out |
 | **R−T** | Router | off | on | on | Leave retry control out |
 | **R−Bu** | Router | on | on | off | Leave budget control out |
-| **R-slo** | Router with `latency_slo_ms` = p50 attempt latency of `opus@medium` on the dev sweep | on | on | on | Latency-constrained routing |
+| **R-slo** | Router with `latency_slo_ms` = the median, across the 7 configs, of each config's p90 attempt latency on the dev sweep. This removes some configs on each tier but never all. | on | on | on | Latency-constrained routing |
 
 - **Headline.** CPAT reduction `1 − CPAT(R-full) / CPAT(B0)`, with a bootstrap CI over cases.
 - **"Quality held constant"** means non-inferiority. The lower bound of the paired 95% CI on `acceptance(R-full) − acceptance(B0)` must sit above **−5 points**. If it doesn't, the result is reported as "inconclusive" or "inferior". The margin is never widened after the fact. The coverage difference (judged on B0 and R-full only) is reported too.
@@ -353,7 +355,7 @@ All arms run on the **test split**, with R = 3 and the same cases and seeds. The
   - Routing alone: R-route vs B0.
   - Controls alone: B1 vs B0.
   - Each control's marginal contribution: R-full vs R−C, R−T, and R−Bu.
-  - Latency: R-slo's SLO attainment, CPAT, and acceptance.
+  - Latency: R-slo's SLO attainment (the share of attempts within the SLO, and the share of tasks never `slo_unmet`), CPAT, and acceptance.
 
   This is what backs "through context, retry, and token-budget controls" and "latency".
 - **Honesty check.** R-full vs B2 is always reported. If the router does not beat B2, the README says so.
@@ -471,6 +473,7 @@ prompt-eval-harness/
 The planning assumptions are averages that the Phase 4 smoke run replaces with measured ones:
 
 - **Per generation:** 1,500 input and 4,000 output tokens, including thinking. `opus@low` is assumed at 2,500 output.
+- **Retry input growth is not modeled.** Arms with context control off resend the full pytest output and conversation, so their retries grow in input. The upper-bound column absorbs this, and the P4 smoke run replaces it with a measured figure.
 - **Per judge call:** 4,000 input and 1,200 output tokens.
 - **Resulting per-call prices:** haiku and luna $0.0022, terra $0.0215, sonnet and sol $0.043, opus@low $0.056, opus@medium $0.086, jury $0.040 per judged trial.
 
