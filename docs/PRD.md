@@ -181,7 +181,8 @@ Each trial runs in a fresh container:
 
 ```
 docker run --rm -i --network none --read-only
-  --tmpfs /work:rw,size=64m --tmpfs /tmp:rw,size=16m
+  --tmpfs /work:rw,size=64m,uid=10001,gid=10001,mode=0700
+  --tmpfs /tmp:rw,size=16m,uid=10001,gid=10001,mode=0700
   --user 10001:10001 --cap-drop ALL --security-opt no-new-privileges
   --pids-limit 128 --memory 512m --memory-swap 512m --cpus 1
   --ulimit nofile=256:256 --ulimit fsize=33554432
@@ -190,12 +191,16 @@ docker run --rm -i --network none --read-only
 ```
 
 - **Input.** A tar stream on stdin holding `solution.py`, the selected test file(s), and `context/`. There are no host volume mounts, no Docker socket, and no environment passthrough. No credentials of any kind enter the container.
-- **Execution.** The in-image runner unpacks the tar to `/work` and runs `pytest -q -p no:cacheprovider --junitxml=/work/report.xml`. It then emits the report on stdout.
+- **Execution.** The in-image runner, `/opt/peh/runner.py`, is trusted and read-only. It runs in four steps:
+  1. It marks itself non-dumpable (`prctl(PR_SET_DUMPABLE, 0)`), so the candidate's process can't read its memory or file descriptors.
+  2. It safely unpacks the tar to `/work`: regular files only, no absolute paths, no `..`, no links.
+  3. It runs `python -m pytest -q -p no:cacheprovider --junitxml=/work/report.xml` as a **child process**, with stdout and stderr piped back to the runner.
+  4. When the child exits, the runner alone writes one JSON envelope to the container's stdout: exit code, report, and output tails. The candidate code can't write to the container's stdout at all.
 - **Host side.** A hard wall-clock timeout (default 30 s, plus 5 s grace) triggers `docker kill`. stdout and stderr are each capped at 256 KB. The JUnit XML is parsed with `defusedxml`. Every call uses an argv list. `shell=True` is never used.
-- **Integrity.** The candidate code runs in-process with pytest, so it could try to forge results.
-  - A trial passes only if the parsed report contains **exactly the expected test node IDs** (taken from the host's copy of the test file), all passed. Missing, extra, or forged IDs score as a fail with status `tamper_suspect`.
-  - This manifest check is the only tamper signal that affects acceptance.
-  - A static scan *records* flags (`os._exit`, `sys.exit` at module level, imports of `pytest`, `_pytest`, or `ctypes`, and reads of `test_*.py`) in `tamper_flags` for manual review. These flags never change the score, because legitimate code can trip them.
+- **Integrity.** The candidate code runs in-process with pytest. It could in principle forge results, by writing a fake report or exiting early.
+  - **Manifest check.** A trial passes only if the parsed report covers **exactly the expected tests**, all passed. The expected tests are found by AST-parsing the host's copy of the test file. Parametrized cases are matched by base test name. Missing or extra tests give `tamper_suspect`.
+  - **Static forgery scan** (AST, on the host). Patterns that are only needed to forge a result give `tamper_suspect`: `os._exit`, `os.kill`, imports of `pytest`, `_pytest`, `ctypes`, or `faulthandler`, assignment into `sys.modules`, and any string literal naming `junit` or `report.xml`. Other suspicious patterns are only *recorded* in `tamper_flags` for review: `inspect`, `sys.exit`, `gc.get_objects`, and reads of `test_*.py`. Legitimate code can use those.
+  - **Residual risk,** stated in `THREAT_MODEL.md`. Grading integrity against *deliberately obfuscated* adversarial code is best-effort. Host containment is not best-effort. It is the hard guarantee.
 - **Result classes.** `passed`, `failed`, `timeout`, `resource_limit` (OOM or pids), `tamper_suspect`, and `sandbox_error`. Only `sandbox_error` is an infra error (§5.8).
 - **Image.** `python:3.12-slim` pinned by digest, with `pytest` pinned. It is built once by `promptharness sandbox build`.
 - **Concurrency.** A semaphore, default 4. Containers are removed after every trial, and a test asserts none leak.
@@ -629,17 +634,19 @@ During this project, models under test run with no tools, no web access, and an 
 
 `config/models.yaml` is the source of truth from Phase 0 onward. It records `verified_on` and the source URL for each entry. Prices are USD per 1M tokens, standard tier.
 
-| Model ID | Input | Cache read | Output | Notes |
-|---|---|---|---|---|
-| `claude-opus-5-5` | 4.00 | 0.20 | 20.00 | Thinking always on; effort default `medium` |
-| `claude-sonnet-5-5` | 2.00 | 0.20 | 10.00 | Effort default `high` |
-| `claude-haiku-5-5` | 0.10 | verify in Phase 0 | 0.50 | Prompts > 100K tokens: $0.50 / $2.50 |
-| `gpt-6.1-sol` | 2.00 | 0.10 | 10.00 | Inputs > 272K tokens: $4.00 / $15.00 |
-| `gpt-6.1-terra` | 1.00 | 0.05 | 5.00 | Inputs > 272K tokens: $2.00 / $7.50 |
-| `gpt-6-luna` | 0.10 | 0.01 | 0.50 | Inputs > 272K tokens: $0.20 / $0.75 |
+| Model ID | Input | Cache write 5m | Cache write 1h | Cache read | Output | Notes |
+|---|---|---|---|---|---|---|
+| `claude-opus-5-5` | 4.00 | 5.00 | 8.00 | 0.20 | 20.00 | Thinking always on; effort default `medium` |
+| `claude-sonnet-5-5` | 2.00 | 2.50 | 4.00 | 0.10 | 10.00 | Effort default `high` |
+| `claude-haiku-5-5` | 0.10 | 0.125 | 0.20 | 0.01 | 0.50 | Prompts > 100K tokens: 0.50 / 0.625 / 1.00 / 0.05 / 2.50 |
+| `claude-fable-5-1` | 10.00 | 12.50 | 20.00 | 0.25 | 50.00 | Auditor and labeler only; not in the router pool |
+| `gpt-6.1-sol` | 2.00 | n/a | n/a | 0.10 | 10.00 | Inputs > 272K tokens: 4.00 / 0.20 / 15.00 |
+| `gpt-6.1-terra` | 1.00 | n/a | n/a | 0.05 | 5.00 | Inputs > 272K tokens: 2.00 / 0.10 / 7.50 |
+| `gpt-6-luna` | 0.10 | n/a | n/a | 0.01 | 0.50 | Inputs > 272K tokens: 0.20 / 0.02 / 0.75 |
 
-- **Sources.** Anthropic prices come from the claude-api skill's model table (cached 2026-10-06). OpenAI prices come from <https://developers.openai.com/api/docs/pricing>, fetched 2026-11-06.
-- **Cache writes.** Anthropic charges for cache writes. Phase 0 records the exact write multiplier from the pricing page. It is not assumed.
+- **Anthropic prices** are from <https://platform.claude.com/docs/en/about-claude/pricing>, fetched 2026-11-06. They were cross-checked against Claude Code's own `costUSD` (costBasis `list`) on live calls. For example, Opus 5.5 with 2 input, 686 cache-write-1h, and 1,037 output tokens costs $0.026236, which matches exactly. The claude-api skill's cached table listed Sonnet 5.5 cache reads at $0.20; the pricing page says $0.10, and the page wins.
+- **OpenAI prices** are from <https://developers.openai.com/api/docs/pricing>, fetched 2026-11-06. OpenAI lists no cache-write surcharge, so cache writes price as input.
+- **Claude Code's cache TTL.** Claude Code writes its prompt cache with the 1-hour TTL (`ephemeral_1h_input_tokens`), so that rate applies to Claude CLI calls.
 
 ## Appendix B: `results.jsonl` row
 

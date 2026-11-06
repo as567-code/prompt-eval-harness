@@ -55,7 +55,7 @@ Each phase works on its own branch, `phase-N-<name>`, in a git worktree (`superp
 - A `uv` project (Python 3.12) with the src layout from PRD §11.
 - The Typer CLI skeleton: `promptharness --version` and `--help`.
 - pydantic config loading.
-- `config/models.yaml` with the Appendix A values plus `verified_on` and `source` fields. Phase 0 also fills in the Haiku cache-read price and the Anthropic cache-write multiplier from the pricing pages.
+- `config/models.yaml` with the verified Appendix A values (all cache tiers included), plus `verified_on` and `source` fields.
 - `cost.py`: a pure function, `usage × catalog prices → USD`, covering cache and long-context tiers.
 - A logging redaction filter.
 - `.gitignore` covering `.env`, `runs/`, `data/`, and `site/`, plus `.env.example`.
@@ -120,7 +120,8 @@ Each phase works on its own branch, `phase-N-<name>`, in a git worktree (`superp
 - [ ] Allocating 2 GB ends as `resource_limit` (OOM). An infinite loop ends as `timeout` within 35 s. The host-side kill is confirmed.
 - [ ] Printing 50 MB is truncated at 256 KB and host RSS stays bounded.
 - [ ] Inside the container, `id -u` is not 0, `/proc/self/status` shows `CapEff: 0000000000000000`, and `/var/run/docker.sock` is absent.
-- [ ] `os._exit(0)` at import, a forged `report.xml`, and monkeypatching `_pytest` each end as `tamper_suspect` or `failed`, never `passed`.
+- [ ] `os._exit(0)` at import, a forged `report.xml`, and monkeypatching `_pytest` each end as `tamper_suspect` or `failed`, never `passed`. Candidate `print`/`os.write(1, …)` of a fake envelope never reaches the host parser, because only the runner writes to container stdout.
+- [ ] `THREAT_MODEL.md` states the residual risk: integrity against deliberately obfuscated forgery is best-effort, while host containment is the hard guarantee.
 - [ ] After the suite, `docker ps -a --filter name=peh-` is empty (no leaks).
 - [ ] `hadolint sandbox/Dockerfile` is clean. `trivy image` reports no fixable HIGH or CRITICAL. `bandit` shows no `shell=True` and no B603/B607 left unreviewed.
 - [ ] The `THREAT_MODEL.md` threat table matches PRD §9, and each row links to its test.
