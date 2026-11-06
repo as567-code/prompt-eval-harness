@@ -179,3 +179,29 @@ def test_normal_exit_kills_leftover_group_members(tmp_path: Path) -> None:
         time.sleep(0.1)
         survivors = _pgrep("sleep 6063")
     assert survivors == []
+
+
+@pytest.mark.parametrize("timeout_s", [10.0, 1.0])
+def test_never_killpg_after_reap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, timeout_s: float
+) -> None:
+    events: list[str] = []
+    real_killpg = os.killpg
+    real_wait = subprocess.Popen.wait
+
+    def rec_killpg(pgid: int, sig: int) -> None:
+        events.append("killpg")
+        real_killpg(pgid, sig)
+
+    def rec_wait(self: "subprocess.Popen[bytes]", *args: object, **kw: object) -> int:
+        events.append("wait")
+        return real_wait(self, *args, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "killpg", rec_killpg)
+    monkeypatch.setattr(subprocess.Popen, "wait", rec_wait)
+    body = "import time\ntime.sleep(60)\n" if timeout_s < 5 else "print('x')\n"
+    script = _script(tmp_path, body)
+    run_cli([str(script)], cwd=tmp_path, timeout_s=timeout_s)
+    assert events.count("killpg") == 1
+    assert "wait" in events
+    assert events.index("killpg") < events.index("wait")
