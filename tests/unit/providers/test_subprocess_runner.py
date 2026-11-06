@@ -1,5 +1,7 @@
+import contextlib
 import json
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -9,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from promptharness.providers.subprocess_runner import CliResult, run_cli
+from promptharness.providers.subprocess_runner import CliResult, _waitid_nowait, run_cli
 
 
 def _script(tmp_path: Path, body: str) -> Path:
@@ -187,21 +189,71 @@ def test_never_killpg_after_reap(
 ) -> None:
     events: list[str] = []
     real_killpg = os.killpg
-    real_wait = subprocess.Popen.wait
+    real_waitpid = os.waitpid
 
     def rec_killpg(pgid: int, sig: int) -> None:
         events.append("killpg")
         real_killpg(pgid, sig)
 
-    def rec_wait(self: "subprocess.Popen[bytes]", *args: object, **kw: object) -> int:
-        events.append("wait")
-        return real_wait(self, *args, **kw)  # type: ignore[arg-type]
+    def rec_waitpid(pid: int, options: int) -> tuple[int, int]:
+        if not options & os.WNOHANG:
+            events.append("reap")
+        return real_waitpid(pid, options)
 
     monkeypatch.setattr(os, "killpg", rec_killpg)
-    monkeypatch.setattr(subprocess.Popen, "wait", rec_wait)
+    monkeypatch.setattr(os, "waitpid", rec_waitpid)
     body = "import time\ntime.sleep(60)\n" if timeout_s < 5 else "print('x')\n"
     script = _script(tmp_path, body)
     run_cli([str(script)], cwd=tmp_path, timeout_s=timeout_s)
     assert events.count("killpg") == 1
-    assert "wait" in events
-    assert events.index("killpg") < events.index("wait")
+    assert "reap" in events
+    assert events.index("killpg") < events.index("reap")
+
+
+def test_waitid_nowait_direct() -> None:
+    proc = subprocess.Popen(["sleep", "1"])  # noqa: S607
+    try:
+        assert _waitid_nowait(proc.pid) is False
+        deadline = time.monotonic() + 5
+        while not _waitid_nowait(proc.pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert _waitid_nowait(proc.pid) is True
+        assert _waitid_nowait(proc.pid) is True
+        pid, status = os.waitpid(proc.pid, 0)
+        assert pid == proc.pid
+        assert os.WIFEXITED(status)
+        assert os.WEXITSTATUS(status) == 0
+        with pytest.raises(ChildProcessError):
+            _waitid_nowait(proc.pid)
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        with contextlib.suppress(ChildProcessError):
+            os.waitpid(proc.pid, os.WNOHANG)
+
+
+def test_waitid_nowait_stopped_child_not_exited() -> None:
+    proc = subprocess.Popen(["sleep", "30"])  # noqa: S607
+    try:
+        os.kill(proc.pid, signal.SIGSTOP)
+        time.sleep(0.3)
+        assert _waitid_nowait(proc.pid) is False
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_stopped_leader_waits_for_timeout(tmp_path: Path) -> None:
+    script = _script(
+        tmp_path,
+        """
+        import os, signal
+        print("before", flush=True)
+        os.kill(os.getpid(), signal.SIGSTOP)
+        """,
+    )
+    result = run_cli([str(script)], cwd=tmp_path, timeout_s=2)
+    assert result.timed_out is True
+    assert result.returncode is None
+    assert "before" in result.stdout
+    assert result.wall_ms >= 1900

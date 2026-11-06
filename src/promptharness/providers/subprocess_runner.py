@@ -19,6 +19,7 @@ import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from promptharness.security import safe_env
 
@@ -44,24 +45,42 @@ class CliResult:
 
 
 _FLAGS = os.WEXITED | os.WNOWAIT | os.WNOHANG
+_EXIT_CODES = frozenset({1, 2, 3})  # CLD_EXITED, CLD_KILLED, CLD_DUMPED (not CLD_STOPPED etc.)
+_SIGINFO_SIZE = 128
+_SI_CODE_OFFSET = 8  # macOS siginfo_t: si_signo @0, si_errno @4, si_code @8
+
+_libc_waitid: Any = None
+if not hasattr(os, "waitid") and sys.platform == "darwin":
+    _libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    _libc_waitid = _libc.waitid
+    _libc_waitid.argtypes = [ctypes.c_int, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_int]
+    _libc_waitid.restype = ctypes.c_int
 
 
 def _waitid_nowait(pid: int) -> bool:
-    """waitid(P_PID, pid, WEXITED|WNOWAIT|WNOHANG): True if exited. Raises ChildProcessError.
+    """waitid(P_PID, pid, WEXITED|WNOWAIT|WNOHANG): True once the child has exited (unreaped).
 
-    os.waitid is missing on macOS, so fall back to libc via ctypes. Only si_signo (offset 0 in
-    both Linux and macOS siginfo_t, left zero when nothing exited) is inspected.
+    A stopped child is not exited. Raises ChildProcessError if the child was already reaped.
+    os.waitid is missing on macOS, so there libc waitid is called through ctypes and the
+    freshly zeroed siginfo buffer is read: the kernel leaves it untouched when nothing is
+    waitable, so si_signo != 0 and si_code in CLD_EXITED/KILLED/DUMPED means "exited".
     """
     if hasattr(os, "waitid"):
-        return os.waitid(os.P_PID, pid, _FLAGS) is not None
-    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-    info = ctypes.create_string_buffer(128)
-    if libc.waitid(os.P_PID, pid, info, _FLAGS) != 0:
+        res = os.waitid(os.P_PID, pid, _FLAGS)
+        return res is not None and res.si_code in _EXIT_CODES
+    if _libc_waitid is None:
+        raise RuntimeError("waitid unavailable on this platform")
+    info = ctypes.create_string_buffer(_SIGINFO_SIZE)  # fresh and zeroed on every call
+    if _libc_waitid(os.P_PID, pid, ctypes.addressof(info), _FLAGS) != 0:
         err = ctypes.get_errno()
         if err == errno.ECHILD:
             raise ChildProcessError(err, os.strerror(err))
         raise OSError(err, os.strerror(err))
-    return int.from_bytes(info.raw[:4], sys.byteorder) != 0
+    signo = int.from_bytes(info.raw[0:4], sys.byteorder, signed=True)
+    code = int.from_bytes(
+        info.raw[_SI_CODE_OFFSET : _SI_CODE_OFFSET + 4], sys.byteorder, signed=True
+    )
+    return signo != 0 and code in _EXIT_CODES
 
 
 def _exited_unreaped(proc: subprocess.Popen[bytes]) -> bool | None:
@@ -133,6 +152,7 @@ def run_cli(
                 exited = _exited_unreaped(proc)
                 if exited is None:
                     state["reaped"] = True
+                    proc.poll()  # reaped elsewhere: Popen records a returncode on ECHILD
                     grace_end = now + POST_EXIT_GRACE_S
                 elif exited:
                     kill_and_reap()  # leftover group members must not outlive the run
@@ -165,6 +185,7 @@ def run_cli(
                 exited = _exited_unreaped(proc)
             if exited is None:
                 state["reaped"] = True
+                proc.poll()
             else:
                 timed_out = timed_out or not exited
                 kill_and_reap()
