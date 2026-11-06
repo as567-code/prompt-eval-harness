@@ -1,0 +1,62 @@
+[project]
+name = "promptharness"
+version = "0.1.0"
+description = "Prompt-evaluation harness and model router that calls LLMs only through the claude and codex CLIs."
+readme = "README.md"
+authors = [
+    { name = "Aditya", email = "adityaswaroop23@gmail.com" }
+]
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "defusedxml>=0.7.1",
+    "pydantic>=2",
+    "pyyaml>=6.0.3",
+    "typer>=0.28.0",
+]
+
+[project.scripts]
+promptharness = "promptharness.cli:app"
+
+[build-system]
+requires = ["uv_build>=0.13.7,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "bandit>=1.9.4",
+    "mypy>=2.4.1",
+    "pip-audit>=2.10.1",
+    "pre-commit>=4.7.0",
+    "pytest>=9.2.0",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.17.4",
+    "types-pyyaml>=6.0.12.20261103",
+]
+
+[tool.ruff]
+line-length = 100
+extend-exclude = ["docs", ".superpowers"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "S", "UP", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]
+
+[tool.mypy]
+strict = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "live: calls the real claude/codex CLIs (requires PEH_LIVE=1)",
+    "docker: requires a working docker daemon and the sandbox image",
+    "adversarial: adversarial/security regression tests",
+]
+addopts = "-m 'not live'"
+
+[tool.coverage.report]
+fail_under = 85
+
+[tool.coverage.run]
+omit = ["src/promptharness/providers/sdk_*"]
