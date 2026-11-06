@@ -1,5 +1,6 @@
 import io
 import logging
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -212,3 +213,19 @@ def test_redact_record_redacts_stack_info() -> None:
     _redact_record(record)
     assert record.stack_info is not None
     assert "SECRETstk" not in record.stack_info
+
+
+def test_redaction_is_linear_time() -> None:
+    timings = []
+    for text in ("_token" * 8000, "a_" * 16000):
+        start = time.perf_counter()
+        _redact(text)
+        timings.append(time.perf_counter() - start)
+    print("timings", timings)
+    assert all(t < 0.2 for t in timings)
+
+
+def test_generic_pattern_handles_escaped_quotes() -> None:
+    out = _redact('{"api_key": "ab\\"cdef"}')
+    assert "ab" not in out
+    assert "cdef" not in out
