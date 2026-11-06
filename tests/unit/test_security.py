@@ -1,3 +1,4 @@
+import io
 import logging
 from collections.abc import Iterator
 from pathlib import Path
@@ -85,12 +86,23 @@ def test_redaction(caplog: pytest.LogCaptureFixture) -> None:
     with caplog.at_level(logging.INFO, logger="peh.redact.test"):
         logger.info(
             "key sk-ant-api03-AbC_123xyz and sk-proj-Zz9 and ghp_abcdefghijklmnopqrstuv "
-            "and Bearer eyJabc"
+            "and Bearer eyJabc and bearer abc.def and github_pat_11ABCDEFG0123456789_abcdef "
+            "and api_key=hunter2"
         )
         logger.info("arg %s", "sk-secret-abc")
     first, second = (r.getMessage() for r in caplog.records)
-    for secret in ("AbC_123xyz", "Zz9", "abcdefghijklmnopqrstuv", "eyJabc"):
+    for secret in (
+        "AbC_123xyz",
+        "Zz9",
+        "abcdefghijklmnopqrstuv",
+        "eyJabc",
+        "abc.def",
+        "11ABCDEFG",
+        "hunter2",
+    ):
         assert secret not in first
+    assert "github_pat_***" in first
+    assert "api_key=***" in first
     assert "sk-***" in first
     assert "ghp_***" in first
     assert "Bearer ***" in first
@@ -132,3 +144,25 @@ def test_redaction_covers_child_loggers(
     assert "sk-***" in msgs[0]
     assert "Bearer ***" in msgs[0]
     assert msgs[1] == "task-force ready"
+
+
+def test_redaction_covers_exception_text(restore_factory: None) -> None:
+    install_redaction()
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger = logging.getLogger("peh.redact.exc")
+    logger.addHandler(handler)
+    logger.propagate = False
+    try:
+        try:
+            raise ValueError("token sk-ant-api03-SECRETxyz")
+        except ValueError:
+            logger.exception("boom")
+        logger.info("stack", stack_info=True)
+    finally:
+        logger.removeHandler(handler)
+    out = stream.getvalue()
+    assert "boom" in out
+    assert "ValueError" in out
+    assert "SECRETxyz" not in out

@@ -32,9 +32,11 @@ _ENV_ALLOWLIST = (
 _SECRET_KEY_RE = re.compile(r"(?i)(API_KEY|AUTH_TOKEN|SECRET|_TOKEN$|PASSWORD)")
 
 _REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"Bearer\s+\S+"), "Bearer ***"),
+    (re.compile(r"(?i)\bBearer\s+\S+"), "Bearer ***"),
+    (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"), "github_pat_***"),
     (re.compile(r"\bsk-[A-Za-z0-9_-]{3,}"), "sk-***"),
     (re.compile(r"\b(gh[pousr])_[A-Za-z0-9]{16,}"), r"\1_***"),
+    (re.compile(r"(?i)\b(api[_-]?key|token|secret|password)\s*[=:]\s*\S+"), r"\1=***"),
 )
 
 
@@ -94,12 +96,24 @@ def _redact(text: str) -> str:
     return text
 
 
+def _redact_record(record: logging.LogRecord) -> None:
+    """Redact message, exception text and stack info of ``record`` in place."""
+    record.msg = _redact(record.getMessage())
+    record.args = None
+    if record.exc_info:
+        record.exc_text = logging.Formatter().formatException(record.exc_info)
+        record.exc_info = None
+    if record.exc_text:
+        record.exc_text = _redact(record.exc_text)
+    if record.stack_info:
+        record.stack_info = _redact(record.stack_info)
+
+
 class RedactingFilter(logging.Filter):
     """Logging filter that masks API keys, GitHub tokens and bearer tokens."""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        record.msg = _redact(record.getMessage())
-        record.args = None
+        _redact_record(record)
         return True
 
 
@@ -111,8 +125,7 @@ def _install_record_factory() -> None:
 
     def factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
         record = current(*args, **kwargs)
-        record.msg = _redact(record.getMessage())
-        record.args = None
+        _redact_record(record)
         return record
 
     factory._peh_redacting = True  # type: ignore[attr-defined]
