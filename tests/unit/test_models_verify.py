@@ -7,9 +7,10 @@ import promptharness.models_cli as models_cli
 from promptharness.catalog import Catalog, ModelEntry
 from promptharness.cli import app
 from promptharness.models_cli import verify_models
-from promptharness.providers.base import Provider, ServedModelMismatch
+from promptharness.providers.base import CliError, Provider, ServedModelMismatch
 from promptharness.providers.claude_cli import ClaudeCLIProvider
 from promptharness.providers.codex_cli import CodexCLIProvider
+from promptharness.providers.control import RunBudget
 from promptharness.providers.fake import FakeProvider
 from promptharness.providers.registry import provider_for
 
@@ -111,3 +112,40 @@ def test_provider_for_maps_providers(tmp_path: Path) -> None:
     codex = next(e for e in cat.by_role("pool") if e.provider == "codex-cli")
     assert isinstance(provider_for(claude, work_root=tmp_path), ClaudeCLIProvider)
     assert isinstance(provider_for(codex, work_root=tmp_path), CodexCLIProvider)
+
+
+def test_budget_exceeded_does_not_abort() -> None:
+    entries = Catalog.load(CATALOG).by_role("pool")[:3]
+    assert len(entries) == 3
+
+    def factory(entry: ModelEntry) -> Provider:
+        return FakeProvider([CliError("boom", transient=True)] * 10)
+
+    rows = verify_models(entries, factory, sleep=lambda _s: None)
+    assert [r.model for r in rows] == [e.id for e in entries]
+    assert all(r.status == "FAIL" for r in rows)
+    assert any(r.detail.startswith("budget_exceeded") for r in rows)
+
+
+def test_budget_accounting() -> None:
+    entries = _entries()
+    budget = RunBudget(max_calls=len(entries) * 2, max_notional_usd=1.0)
+    attempts = {"n": 0}
+
+    class Flaky:
+        name = "flaky"
+
+        def __init__(self, entry: ModelEntry) -> None:
+            self.inner = FakeProvider([FakeProvider.text("ok", model=entry.id)])
+
+        def complete(self, req):  # type: ignore[no-untyped-def]
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise CliError("transient", transient=True)
+            return self.inner.complete(req)
+
+    rows = verify_models(entries, Flaky, budget=budget, sleep=lambda _s: None)
+    assert all(r.status == "OK" for r in rows)
+    assert attempts["n"] == len(entries) + 1
+    assert budget.calls_used == attempts["n"]
+    assert budget.usd_used == pytest.approx(sum(r.notional_usd for r in rows))

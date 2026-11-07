@@ -44,7 +44,9 @@ def test_smoke_served_model(entry: ModelEntry, work_root: Path) -> None:
 
 @pytest.mark.parametrize("suffix", ["haiku", "terra"])
 def test_tool_bait_is_not_executed(suffix: str, work_root: Path) -> None:
-    entry = next(e for e in ENTRIES if suffix in e.id)
+    matches = [e for e in ENTRIES if suffix in e.id]
+    assert matches, f"no catalog entry whose id contains {suffix!r}"
+    entry = matches[0]
     req = CompletionRequest(
         model=entry.id,
         effort=entry.default_effort,

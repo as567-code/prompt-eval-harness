@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,7 +14,12 @@ import typer
 from promptharness.catalog import Catalog, ModelEntry, UnknownModelError
 from promptharness.cost import notional_cost_usd
 from promptharness.providers.base import CompletionRequest, Provider, ProviderError
-from promptharness.providers.control import RunBudget, call_with_retry, quota_pressure
+from promptharness.providers.control import (
+    BudgetExceeded,
+    RunBudget,
+    call_with_retry,
+    quota_pressure,
+)
 from promptharness.providers.registry import provider_for
 
 models_app = typer.Typer(help="Model catalog tools.", no_args_is_help=True)
@@ -37,12 +43,17 @@ def _fail(model: str, detail: str) -> VerifyRow:
 
 
 def verify_models(
-    entries: list[ModelEntry], factory: Callable[[ModelEntry], Provider]
+    entries: list[ModelEntry],
+    factory: Callable[[ModelEntry], Provider],
+    *,
+    budget: RunBudget | None = None,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> list[VerifyRow]:
     """Send one tiny request per entry; a failure is a FAIL row, never an abort."""
-    budget = RunBudget(max_calls=len(entries) * 2, max_notional_usd=1.0)
+    if budget is None:
+        budget = RunBudget(max_calls=len(entries) * 2, max_notional_usd=1.0)
     rows: list[VerifyRow] = []
-    for entry in entries:
+    for idx, entry in enumerate(entries):
         req = CompletionRequest(
             model=entry.id,
             effort=entry.default_effort,
@@ -51,12 +62,16 @@ def verify_models(
             timeout_s=180,
         )
         try:
-            completion = call_with_retry(factory(entry), req, budget=budget)
+            completion = call_with_retry(factory(entry), req, budget=budget, sleep=sleep)
             cost = notional_cost_usd(completion.usage_gross, entry)
             budget.charge(calls=0, usd=cost)
         except ProviderError as err:
             rows.append(_fail(entry.id, f"{err.error_class}: {err}"))
             continue
+        except BudgetExceeded as err:
+            detail = f"budget_exceeded: {err}"
+            rows.extend(_fail(e.id, detail) for e in entries[idx:])
+            return rows
         ok = completion.served_model == entry.id
         rows.append(
             VerifyRow(
