@@ -153,3 +153,9 @@ def test_main_internal_error_emits_single_envelope(
     env = __import__("json").loads(lines[0])
     assert env["error"].startswith("runner_internal: RuntimeError: kaput")
     assert env["junit_xml"] is None
+
+
+@pytest.mark.parametrize("name", ["test_hidden.TestX.py", "a.b/test_x.py"])
+def test_extract_rejects_dotted_module_path(tmp_path: Path, name: str) -> None:
+    with pytest.raises(ValueError, match="dot"):
+        runner.safe_extract(_tar([(name, b"x")]), tmp_path / "w")

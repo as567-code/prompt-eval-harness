@@ -127,3 +127,14 @@ def test_daemon_down_simulation_is_sandbox_error() -> None:
 def test_no_such_image_is_sandbox_error() -> None:
     res = _run(SandboxRunner(image_id="sha256:" + "0" * 64, timeout_s=60), GOOD)
     assert res.status is SandboxStatus.SANDBOX_ERROR, res
+
+
+def test_no_leftover_containers() -> None:
+    ps = subprocess.run(
+        ["docker", "ps", "-a", "-q", "--filter", "name=peh-"],  # noqa: S607
+        capture_output=True,
+        check=True,
+        stdin=subprocess.DEVNULL,
+        text=True,
+    )
+    assert ps.stdout.strip() == ""

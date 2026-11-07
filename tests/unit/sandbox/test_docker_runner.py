@@ -6,6 +6,8 @@ import json
 import os
 import stat
 import tarfile
+import threading
+import time
 from pathlib import Path
 from types import ModuleType
 
@@ -259,7 +261,6 @@ def test_host_timeout_kills_container_and_returns_timeout(tmp_path: Path) -> Non
 def test_docker_argv_is_prd_verbatim(tmp_path: Path) -> None:
     run_with(tmp_path, stdout=line(envelope()))
     argv = (tmp_path / "argv.txt").read_text().splitlines()
-    print("DOCKER ARGV:", argv)
     name = argv[argv.index("--name") + 1]
     assert name.startswith("peh-") and len(name) == len("peh-") + 32
     assert argv[:3] == ["run", "--rm", "-i"]
@@ -315,7 +316,8 @@ def test_build_tar_shape_and_runner_acceptance(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     "name",
-    ["./x.py", "/abs.py", "../x.py", "a/../b.py", "a//b.py", "a b.py", "-x.py", "report.xml",
+    ["test_hidden.TestX.py", "a.b/test_x.py",
+     "./x.py", "/abs.py", "../x.py", "a/../b.py", "a//b.py", "a b.py", "-x.py", "report.xml",
      "context/report.xml", "", "a/", "é.py", "a" * 300, "/".join(["a"] * 2 + ["b" * 101])],
 )  # fmt: skip
 def test_build_tar_rejects_bad_names(name: str) -> None:
@@ -339,9 +341,6 @@ def test_run_rejects_unknown_test_file(tmp_path: Path) -> None:
 
 
 def test_concurrency_semaphore_limits_parallel_runs(tmp_path: Path) -> None:
-    import threading
-    import time
-
     docker = fake_docker(tmp_path, stdout=line(envelope()), sleep=0.3)
     runner = SandboxRunner(image_id="i", docker=str(docker), concurrency=1)
     t0 = time.monotonic()
@@ -366,3 +365,13 @@ def test_fake_docker_env_has_no_secrets(tmp_path: Path, monkeypatch: pytest.Monk
     SandboxRunner(image_id="i", docker=str(script)).run(FILES, test_files=["test_hidden.py"])
     assert "sk-secret" not in (tmp_path / "env.txt").read_text()
     assert os.environ["ANTHROPIC_API_KEY"] == "sk-secret"
+
+
+def test_valid_envelope_wins_over_infra_stderr(tmp_path: Path) -> None:
+    res = run_with(tmp_path, stdout=line(envelope()), stderr="No such image: x")
+    assert res.status is SandboxStatus.PASSED
+
+
+def test_valid_failing_envelope_wins_over_docker_exit_code(tmp_path: Path) -> None:
+    res = run_with(tmp_path, stdout=line(envelope(1, JUNIT_FAIL)), code=125)
+    assert res.status is SandboxStatus.FAILED

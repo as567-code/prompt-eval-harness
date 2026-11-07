@@ -72,6 +72,11 @@ def _validate_name(name: str) -> None:
         raise ValueError(f"invalid sandbox file name: {name!r}")
     if "report.xml" in parts:
         raise ValueError("report.xml is reserved")
+    # Dots in a directory or .py stem would make the junit classname -> file mapping ambiguous.
+    if any("." in p for p in parts[:-1]) or (
+        parts[-1].endswith(".py") and "." in parts[-1][: -len(".py")]
+    ):
+        raise ValueError(f"invalid sandbox file name (dot in module path): {name!r}")
 
 
 def build_tar(files: Mapping[str, str]) -> bytes:
@@ -233,20 +238,20 @@ class SandboxRunner:
         def err(status: SandboxStatus, detail: str) -> SandboxResult:
             return self._result(status, start, detail, stderr_tail=stderr_short)
 
-        if proc.returncode in _DOCKER_INFRA_CODES or any(s in stderr for s in _INFRA_STDERR):
-            return err(
-                SandboxStatus.SANDBOX_ERROR,
-                f"docker error (exit {proc.returncode}): {stderr_short}",
-            )
-        if proc.returncode == 3 and env is not None and env["error"] == "nodumpable":
-            return err(SandboxStatus.SANDBOX_ERROR, "image broken: nodumpable")
         if env is None:
+            if proc.returncode in _DOCKER_INFRA_CODES or any(s in stderr for s in _INFRA_STDERR):
+                return err(
+                    SandboxStatus.SANDBOX_ERROR,
+                    f"docker error (exit {proc.returncode}): {stderr_short}",
+                )
             if proc.returncode == 137:
                 return err(SandboxStatus.RESOURCE_LIMIT, "container killed (exit 137)")
             return err(
                 SandboxStatus.SANDBOX_ERROR,
                 f"no envelope (exit {proc.returncode}): {stderr_short}",
             )
+        if proc.returncode == 3 and env["error"] == "nodumpable":
+            return err(SandboxStatus.SANDBOX_ERROR, "image broken: nodumpable")
 
         stdout_tail = str(env["stdout_tail"])
         stderr_tail = str(env["stderr_tail"])
