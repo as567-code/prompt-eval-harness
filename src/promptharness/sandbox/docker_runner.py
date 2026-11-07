@@ -158,7 +158,8 @@ class SandboxRunner:
             self._docker, "run", "--rm", "-i",
             "--network", "none", "--read-only",
             "--tmpfs", "/work:rw,size=64m,uid=10001,gid=10001,mode=0700",
-            "--tmpfs", "/tmp:rw,size=16m,uid=10001,gid=10001,mode=0700",  # noqa: S108
+            # bandit B108 is a false positive: this is a container-internal tmpfs mount spec.
+            "--tmpfs", "/tmp:rw,size=16m,uid=10001,gid=10001,mode=0700",  # noqa: S108 # nosec B108
             "--user", "10001:10001", "--cap-drop", "ALL",
             "--security-opt", "no-new-privileges",
             "--pids-limit", "128", "--memory", "512m", "--memory-swap", "512m",
