@@ -426,68 +426,46 @@ There are two data paths, and neither puts any model credential in GitHub:
 
 ## 8. Provider layer
 
-- One `Provider` protocol:
+This section states the **invariants**. The exact CLI flags and output shapes are recorded from real captures in [`docs/cli-notes.md`](cli-notes.md), and every ruling is in [`docs/DECISIONS.md`](DECISIONS.md). Where they differ from older text, those two files win.
 
-  ```
-  complete(req: CompletionRequest) -> Completion
-  ```
-
-  `Completion` carries:
-  - `text`
-  - `usage_gross` and `usage_net` (input, output, cache_read, cache_write, reasoning)
+- **One protocol.** `Provider.complete(CompletionRequest) -> Completion`. `Completion` carries:
+  - `text` and `structured`
+  - `status`: OK, TRUNCATED, or REFUSAL
   - `served_model`
-  - `stop_reason`
-  - `latency_ms_net` and `latency_ms_wall`
-  - `attempts`
-  - `tool_attempts`
+  - `usage_gross`, with disjoint buckets (input excludes cache reads and writes; reasoning is a subset of output)
+  - API and wall latency
+  - `cli_attempts` and `tool_attempts`
+  - `output_cap_applied`
   - `cli_version`
+  - `raw`, capped
+  - `quota`
 
-  Live implementations are `ClaudeCLIProvider` and `CodexCLIProvider`. `FakeProvider` (scripted responses) serves every test.
-
-**Common rules for CLI calls**
-- Calls use an argv list, never a shell.
-- Each call runs in a fresh empty temp directory under `runs/<run_id>/cwd/`, so it can't see the repo, the dataset, or the hidden tests.
-- stdin is closed (`< /dev/null`).
-- There is a hard wall-clock timeout of 300 s by default, followed by a process-group kill.
-- stdout is capped at 4 MB.
-- The harness never reads or copies either CLI's credential files. Each CLI resolves its own OAuth login.
-
-**`ClaudeCLIProvider`.** The command is:
-
-```
-claude -p <prompt> --model <id> --effort <lvl> --tools "" --strict-mcp-config
-  --setting-sources "" --system-prompt <s> --output-format json --no-session-persistence
-```
-
-- Add `--json-schema <schema>` for structured output.
-- `--bare` is **not** usable, because it disables OAuth. `--fallback-model` is never passed.
-- Usage comes from `usage` and `modelUsage[model]`. Thinking tokens come from `usage.output_tokens_details.thinking_tokens`. Latency comes from `duration_api_ms`. `stop_reason` and `num_turns` are recorded too.
-- **Tool audit:** `num_turns` must be 1 and `permission_denials` must be empty. Anything else is `tool_use_detected`.
-
-**`CodexCLIProvider`.** The command is:
-
-```
-codex exec --json --ignore-user-config --ignore-rules --skip-git-repo-check -s read-only
-  -m <id> -c model_reasoning_effort="<lvl>" -c model_instructions_file="<file>"
-  -c web_search="disabled"
-```
-
-- Add `--disable <f>` for each of: apps, browser_use, browser_use_external, computer_use, image_generation, multi_agent, memories, plugins, skill_search, sleep_tool, shell_tool, unified_exec, view_image, goals, tool_suggest, hooks, in_app_browser, realtime_conversation, and code_mode_host.
-- Add `--output-schema <file>` for structured output.
-- Usage comes from `turn.completed.usage`.
-- **Tool audit.** The `--json` stream hides tool calls, so the provider must read the session rollout `~/.codex/sessions/**/rollout-*<thread_id>*.jsonl`. Locate it by the `thread_id` from `thread.started`, and **never by modification time**: the owner runs their own Codex sessions concurrently.
-  - Every `custom_tool_call` or `function_call` is recorded in `tool_attempts`.
-  - A call whose output is the fail-closed message ("code-mode host is disabled") is allowed.
-  - Any other tool output gives `tool_use_detected`.
-- **Session cleanup.** After the audit, the provider deletes **only** its own rollouts: those whose `session_meta.cwd` lies under `runs/<run_id>/cwd/`. It never touches any other session.
-
-**Retries.** Only transient CLI failures are retried: a non-zero exit with a network or overload signature. Backoff is jittered exponential (base 2 s, cap 60 s, 4 attempts), and every attempt is recorded. Usage limits pause the lane instead (§5.8).
-
-**Version pinning.** `claude --version` and `codex --version` are recorded in every manifest. P1's contract tests pin the JSON shapes above, so CLI drift fails loudly.
-
-**SDK adapters (stretch, not exercised live).** `AnthropicAPIProvider` (official `anthropic` SDK) and `OpenAIAPIProvider` (official `openai` SDK, Responses API) are written to the same protocol. They follow the claude-api skill's rules: effort set explicitly, no `temperature` or `budget_tokens`, and structured outputs via `output_config.format`. They are tested only against recorded fixtures. They ship as an optional `[sdk]` extra and are labeled in the README as unused for any reported number.
-
-**Multi-provider by design.** The claude-api skill's "always use `claude-opus-5-5`, never downgrade for cost" default does **not** apply to the router pool. Cheaper models are the point of the router. A later implementer must not "fix" this.
+  The live implementations are `ClaudeCLIProvider` (`claude -p`, stream-json) and `CodexCLIProvider` (`codex exec --json` plus an audit of the session rollout). `FakeProvider` serves the tests.
+- **Every CLI subprocess goes through `run_cli`.**
+  - argv only, never a shell, with stdin closed.
+  - A fail-closed environment allowlist that strips API keys, base URLs, and provider switches.
+  - A fresh 0700 work directory per call.
+  - A hard deadline.
+  - A process-group kill that happens only while the group leader is still unreaped.
+- **$0 enforcement (R16, R17, R31, R33).** Every call verifies that the CLI is on subscription auth.
+  - Claude: the init event must report `apiKeySource == "none"`.
+  - Codex: `codex login status` must report a ChatGPT login.
+  - Every call also refuses paid overflow. Claude overage must be off or "rejected". Codex must have no paid credits.
+  - Violations raise `AuthModeError` or `BillingRiskError`. Both are run-fatal.
+- **The audit runs before any error mapping (R29, R32, I5).** On every path, including timeouts, these checks run before any error or exit-code mapping:
+  - Claude: tools and MCP servers are empty, `num_turns` and `permission_denials` are as expected, and there is exactly one served model.
+  - Codex: the rollout is owned by this call's work dir, there is no real tool output (every `*_call` counts, and fail-closed must be an exact match), and the served model and effort match the request.
+- **Argument-injection safety (R19).** Values carrying model or case text use the `--opt=value` form. The prompt is last, after a literal `--`. Codex instructions and schema are passed through files.
+- **Output caps (R13, R14).** A Claude cap hit returns `TRUNCATED` with empty text. Codex has no supported cap, so `output_cap_applied` is always False there.
+- **Owner-session safety (R15, I4).** Codex rollouts are found only by `thread_id`, never by modification time. Only rollouts whose cwd is this call's work dir are deleted, using `codex delete --force` with an unlink fallback. Nothing else under `~/.codex` is read or touched.
+- **Control (`providers/control.py`).**
+  - Retries only on transient CLI errors, with jittered backoff.
+  - `RunBudget` gates every attempt.
+  - `LaneGate` pauses on usage limits.
+  - `quota_pressure` normalises both CLIs' quota data. A lane pauses at `QUOTA_PAUSE_THRESHOLD = 0.85`.
+  - `calibrate_overhead` measures the fixed CLI overhead, so cost can be reported both gross and net of it.
+- **SDK adapters (stretch, not exercised live).** The optional `[sdk]` adapters follow the claude-api skill's rules. They are fixture-tested only and are never used for a reported number.
+- **Multi-provider by design.** The claude-api skill's "always use `claude-opus-5-5`" default does **not** apply to the router pool. Cheaper models are the point.
 
 ## 9. Security requirements
 
