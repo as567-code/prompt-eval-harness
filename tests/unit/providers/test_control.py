@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -220,3 +221,83 @@ def test_quota_pressure_unknown() -> None:
 
 def test_threshold() -> None:
     assert QUOTA_PAUSE_THRESHOLD == 0.85
+
+
+def test_budget_covers_retries() -> None:
+    p = FakeProvider(
+        [CliError("a", transient=True), CliError("b", transient=True), FakeProvider.text("ok")]
+    )
+    b = RunBudget(max_calls=2, max_notional_usd=10.0)
+    with pytest.raises(BudgetExceeded):
+        call_with_retry(p, REQ, sleep=Sleeps(), rand=lambda: 0.5, budget=b)
+    assert b.calls_used == 2
+    assert len(p.requests) == 2
+
+
+def test_budget_charged_on_success_and_nonretry_failure() -> None:
+    b = RunBudget(10, 10.0)
+    call_with_retry(FakeProvider([FakeProvider.text("ok")]), REQ, budget=b)
+    assert b.calls_used == 1
+    with pytest.raises(UsageLimitError):
+        call_with_retry(FakeProvider([UsageLimitError("x")]), REQ, budget=b)
+    assert b.calls_used == 2
+
+
+@pytest.mark.parametrize("usd", [math.nan, math.inf, -1.0])
+def test_charge_rejects_bad_usd(usd: float) -> None:
+    b = RunBudget(1, 1.0)
+    with pytest.raises(ValueError):
+        b.charge(usd=usd)
+    assert (b.calls_used, b.usd_used) == (0, 0.0)
+
+
+def test_charge_rejects_negative_calls() -> None:
+    with pytest.raises(ValueError):
+        RunBudget(1, 1.0).charge(calls=-1, usd=0.0)
+
+
+def test_never_retry_even_if_transient_subclass() -> None:
+    class WeirdTimeout(CliError, CliTimeout):
+        pass
+
+    p = FakeProvider([WeirdTimeout("slow", transient=True), FakeProvider.text("ok")])
+    sleep = Sleeps()
+    with pytest.raises(WeirdTimeout) as ei:
+        call_with_retry(p, REQ, sleep=sleep, rand=lambda: 0.5)
+    assert sleep.calls == []
+    assert ei.value.attempts == 1
+
+
+def test_quota_pressure_nan_ignored() -> None:
+    q = {"unifiedWindows": {"a": {"utilization": math.nan}, "b": {"utilization": 0.3}}}
+    assert quota_pressure(q) == pytest.approx(0.3)
+    assert quota_pressure({"unifiedWindows": {"a": {"utilization": math.nan}}}) is None
+    assert quota_pressure({"primary": {"used_percent": math.inf}}) is None
+
+
+def test_quota_pressure_extra_windows() -> None:
+    q = {
+        "unifiedWindows": {"five_hour": {"utilization": 0.1}, "opus_weekly": {"utilization": 0.95}}
+    }
+    assert quota_pressure(q) == pytest.approx(0.95)
+    c = {"primary": {"used_percent": 1.0}, "tertiary": {"used_percent": 90.0}, "credits": {}}
+    assert quota_pressure(c) == pytest.approx(0.9)
+
+
+def test_quota_pressure_malformed() -> None:
+    assert quota_pressure({"primary": {"used_percent": "90"}}) is None
+    assert quota_pressure({"unifiedWindows": {"five_hour": {"utilization": "0.9"}}}) is None
+    assert quota_pressure({"unifiedWindows": "x", "primary": "y"}) is None
+    assert quota_pressure({"primary": {"used_percent": -5.0}}) == 0.0
+    mixed = {"unifiedWindows": {"five_hour": {"utilization": 0.4}}, "primary": {"used_percent": 60}}
+    assert quota_pressure(mixed) == pytest.approx(0.6)
+
+
+def test_trip_while_tripped_keeps_closed_and_updates_hint() -> None:
+    g = LaneGate(clock=lambda: 0.0, sleep=lambda s: None)
+    g.trip("a")
+    g.trip("b")
+    assert not g.is_open()
+    assert g.reset_hint == "b"
+    g.wait_until_open(lambda: True)
+    assert g.is_open()

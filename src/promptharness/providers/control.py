@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import math
 import random
 import statistics
 import time
@@ -10,14 +11,21 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
 from promptharness.providers.base import (
+    AuthModeError,
     CliError,
+    CliTimeout,
     Completion,
     CompletionRequest,
     Effort,
     Provider,
+    ServedModelMismatch,
+    ToolUseDetected,
+    UsageLimitError,
 )
 
 QUOTA_PAUSE_THRESHOLD = 0.85
+
+_NEVER_RETRY = (UsageLimitError, AuthModeError, ToolUseDetected, ServedModelMismatch, CliTimeout)
 
 
 class BudgetExceeded(Exception):
@@ -37,21 +45,32 @@ def call_with_retry(
     cap_s: float = 60.0,
     sleep: Callable[[float], None] = time.sleep,
     rand: Callable[[], float] = random.random,
+    budget: RunBudget | None = None,
 ) -> Completion:
-    """Retry transient CliError with jittered exponential backoff; nothing else is retried."""
+    """Retry transient CliError with jittered exponential backoff; nothing else is retried.
+
+    With a budget, ``check_can_start()`` runs before EVERY attempt and
+    ``charge(calls=1, usd=0.0)`` after every attempt, success or failure. The caller
+    charges USD separately with ``budget.charge(calls=0, usd=cost)``.
+    """
     req.validate()
     n = 0
     while True:
+        if budget is not None:
+            budget.check_can_start()
         n += 1
         try:
             completion = provider.complete(req)
         except CliError as err:
-            if not err.transient or n >= max_attempts:
+            if isinstance(err, _NEVER_RETRY) or not err.transient or n >= max_attempts:
                 err.attempts = n
                 raise
-            sleep(min(cap_s, base_s * 2 ** (n - 1)) * (0.5 + rand()))
-            continue
-        return dataclasses.replace(completion, cli_attempts=n)
+        else:
+            return dataclasses.replace(completion, cli_attempts=n)
+        finally:
+            if budget is not None:
+                budget.charge(calls=1, usd=0.0)
+        sleep(min(cap_s, base_s * 2 ** (n - 1)) * (0.5 + rand()))
 
 
 class RunBudget:
@@ -70,6 +89,8 @@ class RunBudget:
             )
 
     def charge(self, *, calls: int = 1, usd: float) -> None:
+        if calls < 0 or not math.isfinite(usd) or usd < 0:
+            raise ValueError(f"charge needs calls >= 0 and finite usd >= 0, got {calls}, {usd}")
         self.calls_used += calls
         self.usd_used += usd
 
@@ -135,7 +156,8 @@ def calibrate_overhead(provider: Provider, model: str, effort: Effort, *, n: int
 def _num(x: object) -> float | None:
     if isinstance(x, bool) or not isinstance(x, int | float):
         return None
-    return float(x)
+    f = float(x)
+    return f if math.isfinite(f) else None
 
 
 def quota_pressure(quota: Mapping[str, object] | None) -> float | None:
@@ -148,18 +170,15 @@ def quota_pressure(quota: Mapping[str, object] | None) -> float | None:
             quota = inner
             break
     found: list[float] = []
-    if "unifiedWindows" in quota or "status" in quota:
-        if quota.get("status") == "rejected":
-            found.append(1.0)
-        windows = quota.get("unifiedWindows")
-        if isinstance(windows, Mapping):
-            for key in ("five_hour", "seven_day"):
-                w = windows.get(key)
-                u = _num(w.get("utilization")) if isinstance(w, Mapping) else None
-                if u is not None:
-                    found.append(u)
-    for key in ("primary", "secondary"):
-        w = quota.get(key)
+    if quota.get("status") == "rejected":
+        found.append(1.0)
+    windows = quota.get("unifiedWindows")
+    if isinstance(windows, Mapping):
+        for w in windows.values():
+            u = _num(w.get("utilization")) if isinstance(w, Mapping) else None
+            if u is not None:
+                found.append(u)
+    for w in quota.values():
         pct = _num(w.get("used_percent")) if isinstance(w, Mapping) else None
         if pct is not None:
             found.append(pct / 100.0)
