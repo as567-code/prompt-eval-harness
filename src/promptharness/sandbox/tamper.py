@@ -11,9 +11,10 @@ from dataclasses import dataclass
 
 __all__ = ["TamperReport", "scan"]
 
-_FORBIDDEN_ATTRS = frozenset({"_exit", "kill", "killpg"})
 _FORBIDDEN_MODULES = frozenset({"pytest", "_pytest", "ctypes", "faulthandler"})
-_FORBIDDEN_STRINGS = ("junit", "report.xml")
+_OS_KILLS = frozenset({"kill", "killpg"})
+_DYNAMIC = frozenset({"exec", "eval", "compile"})
+_BUILTINS_BASES = frozenset({"builtins", "__builtins__"})
 _MODULES_MUTATORS = frozenset({"update", "__setitem__", "__delitem__", "setdefault", "pop"})
 
 
@@ -23,25 +24,58 @@ class TamperReport:
     info: tuple[str, ...]
 
 
-def _is_sys_modules(node: ast.AST) -> bool:
-    return (
-        isinstance(node, ast.Attribute)
-        and node.attr == "modules"
-        and isinstance(node.value, ast.Name)
-        and node.value.id == "sys"
-    )
-
-
 def _const_str(node: ast.AST | None) -> str | None:
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return node.value
     return None
 
 
+def _module_aliases(tree: ast.AST, module: str) -> set[str]:
+    """Local names bound to ``module`` by ``import module`` / ``import module as x``."""
+    names = {module}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == module and alias.asname:
+                    names.add(alias.asname)
+    return names
+
+
+def _docstring_like_ids(tree: ast.AST) -> set[int]:
+    """Ids of string constants used as bare expression statements (docstrings included)."""
+    return {
+        id(node.value)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Expr) and _const_str(node.value) is not None
+    }
+
+
 class _Scanner(ast.NodeVisitor):
-    def __init__(self) -> None:
+    def __init__(self, tree: ast.AST) -> None:
         self.forgery: set[str] = set()
         self.info: set[str] = set()
+        self._os = _module_aliases(tree, "os")
+        self._sys = _module_aliases(tree, "sys")
+        self._doc_ids = _docstring_like_ids(tree)
+
+    def _is_os(self, node: ast.AST) -> bool:
+        if isinstance(node, ast.Name):
+            return node.id in self._os
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "__import__"
+            and bool(node.args)
+            and _const_str(node.args[0]) == "os"
+        )
+
+    def _is_sys_modules(self, node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Attribute)
+            and node.attr == "modules"
+            and isinstance(node.value, ast.Name)
+            and node.value.id in self._sys
+        )
 
     def _module(self, name: str) -> None:
         root = name.split(".")[0]
@@ -59,28 +93,32 @@ class _Scanner(ast.NodeVisitor):
         if node.module:
             self._module(node.module)
         for alias in node.names:
-            if alias.name in _FORBIDDEN_ATTRS:
+            if alias.name == "_exit":
+                self.forgery.add("attr:_exit")
+            if node.module == "os" and alias.name in _OS_KILLS:
                 self.forgery.add(f"attr:{alias.name}")
             if node.module == "sys" and alias.name == "modules":
                 self.forgery.add("sys.modules")
-            if node.module is None or node.module == "":
+            if not node.module:
                 self._module(alias.name)
         self.generic_visit(node)
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
-        if node.attr in _FORBIDDEN_ATTRS:
+        if node.attr == "_exit":
+            self.forgery.add("attr:_exit")
+        if node.attr in _OS_KILLS and self._is_os(node.value):
             self.forgery.add(f"attr:{node.attr}")
         if isinstance(node.value, ast.Name):
             base = node.value.id
-            if base == "sys" and node.attr == "exit":
+            if base in self._sys and node.attr == "exit":
                 self.info.add("sys.exit")
             if base == "gc" and node.attr == "get_objects":
                 self.info.add("gc.get_objects")
             if base == "inspect":
                 self.info.add("inspect")
-            if base == "sys" and node.attr == "modules" and isinstance(node.ctx, ast.Store):
+            if base in self._sys and node.attr == "modules" and isinstance(node.ctx, ast.Store):
                 self.forgery.add("sys.modules")
-        if _is_sys_modules(node.value) and node.attr in _MODULES_MUTATORS:
+        if self._is_sys_modules(node.value) and node.attr in _MODULES_MUTATORS:
             self.forgery.add("sys.modules")
         self.generic_visit(node)
 
@@ -90,20 +128,30 @@ class _Scanner(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Subscript(self, node: ast.Subscript) -> None:
-        if _is_sys_modules(node.value) and isinstance(node.ctx, ast.Store | ast.Del):
+        if self._is_sys_modules(node.value) and isinstance(node.ctx, ast.Store | ast.Del):
             self.forgery.add("sys.modules")
         self.generic_visit(node)
 
     def visit_Constant(self, node: ast.Constant) -> None:
         if isinstance(node.value, str):
             low = node.value.lower()
-            for needle in _FORBIDDEN_STRINGS:
-                if needle in low:
-                    self.forgery.add(f"string:{needle}")
+            if "report.xml" in low:
+                self.forgery.add("string:report.xml")
+            if "junit" in low and id(node) not in self._doc_ids:
+                self.forgery.add("string:junit")
         self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
         func = node.func
+        bare = isinstance(func, ast.Name) and func.id in _DYNAMIC
+        via_builtins = (
+            isinstance(func, ast.Attribute)
+            and func.attr in _DYNAMIC
+            and isinstance(func.value, ast.Name)
+            and func.value.id in _BUILTINS_BASES
+        )
+        if bare or via_builtins:
+            self.forgery.add("dynamic_exec")
         first = _const_str(node.args[0]) if node.args else None
         if first is not None:
             is_import_call = (isinstance(func, ast.Name) and func.id == "__import__") or (
@@ -122,12 +170,16 @@ class _Scanner(ast.NodeVisitor):
 
 
 def scan(code: str) -> TamperReport:
-    """Return forgery (verdict-changing) and info (diagnostic only) findings for ``code``."""
+    """Return forgery (verdict-changing) and info (diagnostic only) findings for ``code``.
+
+    ``unscannable`` (RecursionError) is forgery on purpose: such code parses, so it does run.
+    """
     try:
         tree = ast.parse(code)
     except (SyntaxError, ValueError):
-        return TamperReport(forgery=("syntax_error",), info=())
-    scanner = _Scanner()
+        # Code that does not parse cannot run, so it cannot forge anything (R38).
+        return TamperReport(forgery=(), info=("syntax_error",))
+    scanner = _Scanner(tree)
     try:
         scanner.visit(tree)
     except RecursionError:

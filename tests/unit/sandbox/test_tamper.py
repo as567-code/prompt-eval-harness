@@ -40,8 +40,19 @@ def test_scan_clean_solution() -> None:
     [
         "__import__('os')._exit(0)",
         "import os\nos.kill(1, 9)",
+        "import os as o\no.kill(1, 9)",
+        "from os import kill\nkill(1, 9)",
+        "from os import killpg as kp\nkp(1, 9)",
+        "__import__('os').kill(1, 9)",
+        "import sys as s\ns.modules['a'] = 1",
+        'exec("import os; os._exit(0)")',
+        "eval('1')",
+        "compile('x', 'f', 'exec')",
+        "import builtins\nbuiltins.exec('1')",
+        "__builtins__.eval('1')",
+        "x = 'junit'",
+        "open('/work/report.xml', 'w')",
         "import os\nos.killpg(1, 9)",
-        "import signal\nsignal.raise_signal(9)\nx.kill()",
         "import ctypes",
         "from faulthandler import dump_traceback",
         "import os, pytest",
@@ -54,7 +65,6 @@ def test_scan_clean_solution() -> None:
         "x = 'JUnitXML'",
         "x = '/work/Report.XML'",
         "from os import _exit",
-        "def f(:\n",
     ],
 )
 def test_scan_flags_forgery_variants(code: str) -> None:
@@ -76,8 +86,24 @@ def test_scan_info_patterns(code: str, tag: str) -> None:
     assert tag in rep.info
 
 
-def test_syntax_error_is_forgery_syntax_error() -> None:
-    assert scan("def add(:\n") == TamperReport(forgery=("syntax_error",), info=())
+def test_syntax_error_is_info_not_forgery() -> None:
+    assert scan("def add(:\n") == TamperReport(forgery=(), info=("syntax_error",))
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "def f(proc):\n    proc.kill()",
+        "class A:\n    def g(self):\n        self.kill()",
+        '"""Parses JUnit-style results."""\nx = 1',
+        'def f():\n    """JUnit helper."""\n',
+        'class C:\n    """junit"""\n',
+        '"junit"\nx = 1',
+        "import os\nos.getpid()",
+    ],
+)
+def test_scan_false_positives_are_clean(code: str) -> None:
+    assert scan(code).forgery == ()
 
 
 def test_scan_never_executes_code() -> None:
