@@ -83,7 +83,7 @@ def found_rollouts() -> Iterator[list[Path]]:
         mp.undo()
 
 
-def test_codex_rollouts_cleaned_up(work_root: Path, found_rollouts: list[Path]) -> None:
+def test_codex_rollouts_cleanup(work_root: Path, found_rollouts: list[Path]) -> None:
     entry = next(e for e in ENTRIES if e.provider == "codex-cli")
     req = CompletionRequest(
         model=entry.id,
