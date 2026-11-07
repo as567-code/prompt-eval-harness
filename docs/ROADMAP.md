@@ -121,8 +121,8 @@ Each phase works on its own branch, `phase-N-<name>`, in a git worktree (`superp
   - An infinite loop ends as `timeout` or `failed` within 40 s: the inner `PEH_INNER_TIMEOUT` normally fires first, and the host timeout (30 s + 5 s grace) is the backstop.
   - Evidence: `test_memory_bomb`, `test_infinite_loop`. For the host-side `docker kill` and `rm -f` of the named container, `test_host_timeout_kills_container_and_returns_timeout` (unit).
 - [x] Printing 50 MB is truncated by the runner to 16 KB stdout and 16 KB stderr tails, and host RSS stays bounded.
-  - Evidence: `test_stdout_flood`.
-  - Measured 2026-11-06 on Docker Desktop: host process max RSS was 22.0 MB for the flood vs 21.9 MB for a trivial pass, and `docker` CLI child max RSS was 29.4 MB vs 29.6 MB.
+  - Evidence: `test_stdout_flood` (asserts the tail caps only).
+  - Host RSS is from a one-off measurement, not asserted by the test. Measured 2026-11-06 on Docker Desktop: host process max RSS was 22.0 MB for the flood vs 21.9 MB for a trivial pass, and `docker` CLI child max RSS was 29.4 MB vs 29.6 MB.
   - Observed: the flood itself ends as `failed` (collection error, ENOSPC), because pytest's capture file fills the 16 MB `/tmp` tmpfs.
 - [x] Inside the container, `id -u` is not 0, `/proc/self/status` shows `CapEff: 0000000000000000`, and `/var/run/docker.sock` is absent. Evidence: `test_unprivileged`.
 - [x] `os._exit(0)` at import, a forged `report.xml`, and monkeypatching `_pytest` each end as `tamper_suspect` or `failed`, never `passed`.
@@ -136,7 +136,7 @@ Each phase works on its own branch, `phase-N-<name>`, in a git worktree (`superp
   - Bandit's low-severity pass (`-l`) reports 5 B603 and 2 B607 sites: `subprocess_runner.py:109`, `docker_runner.py:226,241`, and `image.py:17,24`.
   - Each one is an argv list with a fixed executable and carries a reviewed `# noqa: S603`/`S607`, because ruff's `S` rules are enabled and force the annotation.
 - [x] The `THREAT_MODEL.md` threat table matches PRD §9 for the sandbox's adversary (A: network, secrets, host filesystem, disk, resources, privilege, forgery), and each row links to its test.
-  - The other PRD §9 rows (judge injection, YAML/XML, path traversal, secret leakage, quota, supply chain, CI, dashboard XSS, owner CLI state) are verified in PRD §9's own "Verified by" column.
+  - The other PRD §9 rows (model-under-test isolation, CLI argument injection, judge injection, YAML/XML, path traversal, secret leakage, quota, supply chain, CI, dashboard XSS, owner CLI state) are verified in PRD §9's own "Verified by" column.
   - They are deepened in their owning phases (judge P4, router P6, dashboards P8).
 
 **Exit:** the adversarial suite passes on Docker Desktop. Median sandbox overhead is measured and recorded, with a target under 2.5 s per trial.
