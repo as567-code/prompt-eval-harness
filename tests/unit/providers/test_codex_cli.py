@@ -65,7 +65,7 @@ class Env:
         rollout: Path | Callable[[Path], str] | None,
         rewrite_cwd: bool = True,
         login: str = LOGIN_OK,
-        delete_ok: bool = True,
+        delete_ok: bool | str = True,
     ) -> None:
         self.work_root = tmp_path / "work"
         self.sessions = tmp_path / "sessions"
@@ -111,10 +111,13 @@ class Env:
         if argv[1:] == ["login", "status"]:
             return _cli(self.login)
         if argv[1:3] == ["delete", "--force"]:
+            assert argv[3] == "--"
+            if self.delete_ok == "zero_keep":
+                return _cli("Deleted (lie)\n")
             if self.delete_ok:
                 assert self.rollout_path is not None
                 self.rollout_path.unlink()
-                return _cli(f"Deleted session {argv[3]}.\n")
+                return _cli(f"Deleted session {argv[4]}.\n")
             return _cli("", rc=1)
         assert argv[1] == "exec"
         self.exec_argv = argv
@@ -376,7 +379,7 @@ def test_own_rollout_deleted_after_call(tmp_path: Path, monkeypatch: pytest.Monk
     env = _env(tmp_path, monkeypatch)
     env.provider.complete(_req())
     tid = _tid(env.stdout)
-    assert ["codex", "delete", "--force", tid] in env.calls
+    assert ["codex", "delete", "--force", "--", tid] in env.calls
     assert env.rollout_path is not None and not env.rollout_path.exists()
     assert list(env.work_root.iterdir()) == []  # workdir removed
 
@@ -407,9 +410,224 @@ def test_delete_failure_falls_back_to_unlink(
 
 def test_foreign_cwd_nothing_deleted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     env = _env(tmp_path, monkeypatch, rewrite_cwd=False)  # cwd stays /TMP/cwd
-    env.provider.complete(_req())
+    with pytest.raises(CliError, match="not owned") as ei:
+        env.provider.complete(_req())
+    assert ei.value.transient is False
     assert not any(c[1] == "delete" for c in env.calls)
     assert env.rollout_path is not None and env.rollout_path.exists()
+
+
+def test_sibling_workdir_cwd_is_not_owned(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def sibling(cwd: Path) -> str:
+        text = (FIX / "rollouts" / "ok_terra.jsonl").read_text()
+        return text.replace("/TMP/cwd", str(cwd.parent / "othercall"))
+
+    env = _env(tmp_path, monkeypatch, rollout=sibling)
+    with pytest.raises(CliError, match="not owned"):
+        env.provider.complete(_req())
+    assert not any(c[1] == "delete" for c in env.calls)
+
+
+def test_delete_returns_zero_but_file_remains_unlinks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _env(tmp_path, monkeypatch, delete_ok="zero_keep")
+    env.provider.complete(_req())
+    assert env.rollout_path is not None and not env.rollout_path.exists()
+
+
+def _usage_stdout(usage: dict[str, Any]) -> str:
+    base = _stdout("ok").splitlines()
+    base[-1] = json.dumps({"type": "turn.completed", "usage": usage})
+    return "\n".join(base) + "\n"
+
+
+def test_usage_cache_write_is_subset_of_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    u = {
+        "input_tokens": 1000,
+        "cached_input_tokens": 300,
+        "cache_write_input_tokens": 200,
+        "output_tokens": 50,
+        "reasoning_output_tokens": 10,
+    }
+    env = Env(
+        tmp_path,
+        monkeypatch,
+        stdout=_usage_stdout(u),
+        rollout=FIX / "rollouts" / "ok_terra.jsonl",
+    )
+    c = env.provider.complete(_req())
+    g = c.usage_gross
+    assert (g.input, g.cache_read, g.cache_write_5m, g.output, g.reasoning) == (
+        500,
+        300,
+        200,
+        50,
+        10,
+    )
+    assert g.input_side == 1000
+
+
+_GOOD = {
+    "input_tokens": 10,
+    "cached_input_tokens": 0,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 1,
+    "reasoning_output_tokens": 0,
+}
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        {},
+        {k: v for k, v in _GOOD.items() if k != "cache_write_input_tokens"},
+        {**_GOOD, "output_tokens": True},
+        {**_GOOD, "output_tokens": -1},
+        {**_GOOD, "cached_input_tokens": 8, "cache_write_input_tokens": 3},
+    ],
+)
+def test_inconsistent_usage_is_cli_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, usage: dict[str, Any]
+) -> None:
+    env = Env(
+        tmp_path,
+        monkeypatch,
+        stdout=_usage_stdout(usage),
+        rollout=FIX / "rollouts" / "ok_terra.jsonl",
+    )
+    with pytest.raises(CliError, match="usage inconsistent") as ei:
+        env.provider.complete(_req())
+    assert ei.value.transient is False
+
+
+def test_unicode_line_separators_kept_in_last_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def ev(text: str) -> str:
+        item = {"type": "agent_message", "text": text}
+        return json.dumps({"type": "item.completed", "item": item}, ensure_ascii=False)
+
+    last = "a\u2028b\u2029c\u0085d"
+    lines = _stdout("ok").splitlines()
+    lines[3:4] = [ev("first\u2028x"), ev(last)]
+    stdout = "\n".join(lines) + "\n"
+    assert parse_codex_events(stdout).messages[-1] == last
+    env = Env(tmp_path, monkeypatch, stdout=stdout, rollout=FIX / "rollouts" / "ok_terra.jsonl")
+    assert env.provider.complete(_req()).text == last
+
+
+def test_timeout_still_cleans_own_rollout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env = _env(tmp_path, monkeypatch)
+    real = env._run
+
+    def timed(argv: Sequence[str], **kw: Any) -> CliResult:
+        if list(argv)[1] == "exec":
+            real(argv, **kw)  # plants the rollout
+            return _cli(_stdout("ok").splitlines()[0] + "\n", rc=None, timed_out=True)
+        return real(argv, **kw)
+
+    monkeypatch.setattr(codex_cli, "run_cli", timed)
+    with pytest.raises(CliTimeout):
+        env.provider.complete(_req())
+    assert env.rollout_path is not None and not env.rollout_path.exists()
+
+
+def test_tool_use_beats_turn_failed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    stdout = (
+        _stdout("ok").splitlines()[0]
+        + "\n"
+        + json.dumps({"type": "turn.failed", "error": {"message": "stream disconnected"}})
+        + "\n"
+    )
+    env = Env(tmp_path, monkeypatch, stdout=stdout, rollout=_tool_rollout("root:x:0:0"))
+    with pytest.raises(ToolUseDetected):
+        env.provider.complete(_req())
+
+
+def test_turn_failed_transient(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    stdout = (
+        _stdout("ok").splitlines()[0]
+        + "\n"
+        + json.dumps({"type": "turn.failed", "error": {"message": "stream disconnected"}})
+        + "\n"
+    )
+    env = Env(tmp_path, monkeypatch, stdout=stdout, rollout=None)
+    with pytest.raises(CliError) as ei:
+        env.provider.complete(_req())
+    assert ei.value.transient is True
+
+
+def test_quota_warning_with_answer_is_not_usage_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stdout = (
+        _err_stdout("model_quota warning", agent=True)
+        + _stdout("ok").split("\n", 1)[1].split("\n", 2)[-1]
+    )
+    env = Env(tmp_path, monkeypatch, stdout=stdout, rollout=FIX / "rollouts" / "ok_terra.jsonl")
+    assert env.provider.complete(_req()).text == "ok"
+
+
+def test_transient_regex_needs_word_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = Env(tmp_path, monkeypatch, stdout=_err_stdout("bad id 15000x"), rollout=None)
+    with pytest.raises(CliError) as ei:
+        env.provider.complete(_req())
+    assert ei.value.transient is False
+
+
+def test_auth_error_details_and_timeout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env = _env(tmp_path, monkeypatch, login="nope")
+    with pytest.raises(AuthModeError, match="exit 0"):
+        env.provider.complete(_req())
+    env2 = _env(tmp_path / "b", monkeypatch)
+    real = env2._run
+
+    def slow(argv: Sequence[str], **kw: Any) -> CliResult:
+        if list(argv)[1:3] == ["login", "status"]:
+            return _cli("", rc=None, timed_out=True)
+        return real(argv, **kw)
+
+    monkeypatch.setattr(codex_cli, "run_cli", slow)
+    with pytest.raises(CliError) as ei:
+        env2.provider.complete(_req())
+    assert ei.value.transient is True and not isinstance(ei.value, AuthModeError)
+
+
+def test_oserror_from_run_cli_wrapped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env = _env(tmp_path, monkeypatch)
+
+    def boom(argv: Sequence[str], **kw: Any) -> CliResult:
+        raise FileNotFoundError("codex")
+
+    monkeypatch.setattr(codex_cli, "run_cli", boom)
+    with pytest.raises(CliError) as ei:
+        env.provider.complete(_req())
+    assert ei.value.transient is False
+    codex_cli.codex_version.cache_clear()
+    env.provider._auth_checked = True
+    with pytest.raises(CliError):
+        env.provider.complete(_req())
+
+
+def test_work_root_with_quote_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        CodexCLIProvider(work_root=tmp_path / 'bad"dir')
+
+
+def test_argv_model_equals_form() -> None:
+    argv = build_codex_argv(
+        _req(model="--evil"),
+        binary="codex",
+        instructions_file=Path("/i.md"),
+        schema_file=None,
+        cwd=Path("/w"),
+    )
+    assert "--model=--evil" in argv and "-m" not in argv
 
 
 def test_missing_rollout_is_cli_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

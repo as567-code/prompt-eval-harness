@@ -65,7 +65,7 @@ CODEX_DISABLED_FEATURES: tuple[str, ...] = (
 )
 
 _USAGE_LIMIT_RE = re.compile(r"usage limit|hit your usage|rate.?limit|try again in|quota", re.I)
-_TRANSIENT_RE = re.compile(r"stream disconnected|overloaded|timeout|5\d\d", re.I)
+_TRANSIENT_RE = re.compile(r"stream disconnected|overloaded|timeout|\b5\d\d\b", re.I)
 _IGNORED_ERROR = "Code Mode is unavailable"
 _CHATGPT_LOGIN = "Logged in using ChatGPT"
 _AUX_TIMEOUT_S = 30.0
@@ -89,8 +89,7 @@ def build_codex_argv(
         "--skip-git-repo-check",
         "-s",
         "read-only",
-        "-m",
-        req.model,
+        f"--model={req.model}",
         "-c",
         f'model_reasoning_effort="{req.effort}"',
         "-c",
@@ -112,20 +111,20 @@ class CodexEvents:
     thread_id: str
     messages: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
-    usage: Mapping[str, int] | None = None
+    usage: Mapping[str, object] | None = None
 
 
 def parse_codex_events(stdout: str) -> CodexEvents:
     thread_id = ""
     messages: list[str] = []
     errors: list[str] = []
-    usage: Mapping[str, int] | None = None
+    usage: Mapping[str, object] | None = None
 
     def add_error(msg: object) -> None:
         if isinstance(msg, str) and _IGNORED_ERROR not in msg:
             errors.append(msg)
 
-    for line in stdout.splitlines():
+    for line in stdout.split("\n"):
         line = line.strip()
         if not line.startswith("{"):
             continue
@@ -145,7 +144,7 @@ def parse_codex_events(stdout: str) -> CodexEvents:
             elif item.get("type") == "error":
                 add_error(item.get("message"))
         elif kind == "turn.completed" and isinstance(ev.get("usage"), dict):
-            usage = {k: v for k, v in ev["usage"].items() if isinstance(v, int)}
+            usage = dict(ev["usage"])
         elif kind == "turn.failed" and isinstance(ev.get("error"), dict):
             add_error(ev["error"].get("message"))
         elif kind == "error":
@@ -156,21 +155,49 @@ def parse_codex_events(stdout: str) -> CodexEvents:
 @functools.cache
 def codex_version(binary: str) -> str:
     """``codex --version``, run once per process per binary (failures are not cached)."""
-    res = run_cli([binary, "--version"], cwd=Path(tempfile.gettempdir()), timeout_s=_AUX_TIMEOUT_S)
+    try:
+        res = run_cli(
+            [binary, "--version"], cwd=Path(tempfile.gettempdir()), timeout_s=_AUX_TIMEOUT_S
+        )
+    except OSError as exc:
+        raise CliError(f"{binary} --version could not run: {exc}", transient=False) from exc
     text = res.stdout.strip()
     if res.timed_out or res.returncode != 0 or not text:
         raise CliError(f"{binary} --version failed", transient=False)
     return text
 
 
-def _usage(raw: Mapping[str, int]) -> Usage:
-    cached = raw.get("cached_input_tokens", 0)
+_USAGE_KEYS = (
+    "input_tokens",
+    "cached_input_tokens",
+    "cache_write_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+)
+
+
+def _usage(raw: Mapping[str, object]) -> Usage:
+    """Map turn.completed usage (cached and cache-write are subsets of input_tokens, R24)."""
+    vals: dict[str, int] = {}
+    for key in _USAGE_KEYS:
+        v = raw.get(key)
+        if not isinstance(v, int) or isinstance(v, bool) or v < 0:
+            raise CliError(f"usage inconsistent: {key}={v!r}", transient=False)
+        vals[key] = v
+    cached = vals["cached_input_tokens"]
+    write = vals["cache_write_input_tokens"]
+    if cached + write > vals["input_tokens"]:
+        raise CliError(
+            f"usage inconsistent: cached {cached} + cache_write {write} > input "
+            f"{vals['input_tokens']}",
+            transient=False,
+        )
     return Usage(
-        input=max(raw.get("input_tokens", 0) - cached, 0),
-        output=raw.get("output_tokens", 0),
+        input=vals["input_tokens"] - cached - write,
+        output=vals["output_tokens"],
         cache_read=cached,
-        cache_write_5m=raw.get("cache_write_input_tokens", 0),
-        reasoning=raw.get("reasoning_output_tokens", 0),
+        cache_write_5m=write,
+        reasoning=vals["reasoning_output_tokens"],
     )
 
 
@@ -181,7 +208,7 @@ def _rollout_quota(path: Path) -> Mapping[str, object] | None:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
-    for line in text.splitlines():
+    for line in text.split("\n"):
         if '"token_count"' not in line:
             continue
         try:
@@ -209,6 +236,8 @@ class CodexCLIProvider:
         binary: str = "codex",
         sessions_root: Path = CODEX_SESSIONS_ROOT,
     ) -> None:
+        if re.search(r'["\\\n\r]', str(work_root.resolve())):
+            raise ValueError("work_root must not contain quotes, backslashes or newlines")
         self._work_root = work_root
         self._binary = binary
         self._sessions_root = sessions_root
@@ -217,13 +246,21 @@ class CodexCLIProvider:
     def _check_auth(self) -> None:
         if self._auth_checked:
             return
-        res = run_cli(
-            [self._binary, "login", "status"],
-            cwd=Path(tempfile.gettempdir()),
-            timeout_s=_AUX_TIMEOUT_S,
-        )
+        try:
+            res = run_cli(
+                [self._binary, "login", "status"],
+                cwd=Path(tempfile.gettempdir()),
+                timeout_s=_AUX_TIMEOUT_S,
+            )
+        except OSError as exc:
+            raise CliError(f"codex login status could not run: {exc}", transient=False) from exc
+        if res.timed_out:
+            raise CliError("codex login status timed out", transient=True)
         if _CHATGPT_LOGIN not in res.stdout + res.stderr:
-            raise AuthModeError(f"codex login status does not show ChatGPT login: {res.stdout!r}")
+            raise AuthModeError(
+                f"codex login status does not show ChatGPT login (exit {res.returncode}): "
+                f"{res.stdout[:300]!r} stderr={res.stderr[:300]!r}"
+            )
         self._auth_checked = True
 
     def complete(self, req: CompletionRequest) -> Completion:
@@ -255,17 +292,17 @@ class CodexCLIProvider:
                 cwd=workdir,
                 timeout_s=req.timeout_s,
             )
-            if res.timed_out:
-                raise CliTimeout(f"codex timed out after {req.timeout_s}s")
             events = parse_codex_events(res.stdout)
             thread_id = events.thread_id
             if thread_id:
                 audit = self._load_audit(thread_id, started)
-            return self._map(req, res, events, audit, version)
+            if res.timed_out:
+                raise CliTimeout(f"codex timed out after {req.timeout_s}s")
+            return self._map(req, res, events, audit, version, workdir)
         finally:
             try:
                 if audit is not None:
-                    self._cleanup(audit, thread_id)
+                    self._cleanup(audit, thread_id, workdir)
             finally:
                 shutil.rmtree(workdir, ignore_errors=True)
 
@@ -276,19 +313,21 @@ class CodexCLIProvider:
         except (FileNotFoundError, ValueError, OSError):
             return None
 
-    def _owned(self, audit: RolloutAudit) -> bool:
+    @staticmethod
+    def _owned(audit: RolloutAudit, workdir: Path) -> bool:
+        """The rollout belongs to THIS call: absolute cwd that resolves to our work dir."""
         cwd = audit.cwd
         if cwd is None or not cwd.is_absolute():
             return False
-        return cwd.resolve().is_relative_to(self._work_root.resolve())
+        return cwd.resolve() == workdir.resolve()
 
-    def _cleanup(self, audit: RolloutAudit, thread_id: str) -> None:
+    def _cleanup(self, audit: RolloutAudit, thread_id: str, workdir: Path) -> None:
         """Delete our own rollout (``codex delete --force``, else unlink); never anything else."""
-        if not self._owned(audit):
+        if not self._owned(audit, workdir):
             return
         with contextlib.suppress(Exception):  # cleanup must never mask the call result
             res = run_cli(
-                [self._binary, "delete", "--force", thread_id],
+                [self._binary, "delete", "--force", "--", thread_id],
                 cwd=Path(tempfile.gettempdir()),
                 timeout_s=_AUX_TIMEOUT_S,
             )
@@ -304,11 +343,28 @@ class CodexCLIProvider:
         events: CodexEvents,
         audit: RolloutAudit | None,
         version: str,
+        workdir: Path,
     ) -> Completion:
-        for msg in events.errors:
-            if _USAGE_LIMIT_RE.search(msg):
-                raise UsageLimitError(msg)
+        # The rollout is the only evidence of tool use: audit it before any error mapping.
+        if audit is not None:
+            if not self._owned(audit, workdir):
+                raise CliError("rollout not owned by this call", transient=False)
+            if audit.real_tool_output:
+                raise ToolUseDetected(
+                    "codex tool output: "
+                    + "; ".join(c.output_excerpt for c in audit.tool_calls if not c.failed_closed)
+                )
+            if audit.model != req.model:
+                raise ServedModelMismatch(req.model, audit.model or "<none>")
+            if audit.effort != req.effort:
+                raise CliError(
+                    f"codex ran with effort {audit.effort!r}, requested {req.effort!r}",
+                    transient=False,
+                )
         if not events.messages:
+            for msg in events.errors:
+                if _USAGE_LIMIT_RE.search(msg):
+                    raise UsageLimitError(msg)
             if events.errors:
                 msg = "; ".join(events.errors)
                 raise CliError(msg, transient=bool(_TRANSIENT_RE.search(msg)))
@@ -318,20 +374,9 @@ class CodexCLIProvider:
             raise CliError(f"codex exited {res.returncode} with an agent message", transient=False)
         if events.usage is None:
             raise CliError("no turn.completed usage in codex output", transient=False)
+        usage = _usage(events.usage)
         if audit is None:
             raise CliError("no rollout found for codex thread; cannot audit tools", transient=False)
-        if audit.real_tool_output:
-            raise ToolUseDetected(
-                "codex tool output: "
-                + "; ".join(c.output_excerpt for c in audit.tool_calls if not c.failed_closed)
-            )
-        if audit.model != req.model:
-            raise ServedModelMismatch(req.model, audit.model or "<none>")
-        if audit.effort != req.effort:
-            raise CliError(
-                f"codex ran with effort {audit.effort!r}, requested {req.effort!r}",
-                transient=False,
-            )
         text = events.messages[-1]
         structured: Mapping[str, object] | None = None
         if req.json_schema is not None:
@@ -349,8 +394,8 @@ class CodexCLIProvider:
             structured=structured,
             status=Status.OK,
             stop_reason=None,
-            served_model=audit.model,
-            usage_gross=_usage(events.usage),
+            served_model=req.model,  # equals audit.model (checked above)
+            usage_gross=usage,
             latency_ms_api=None,
             latency_ms_wall=res.wall_ms,
             cli_attempts=1,

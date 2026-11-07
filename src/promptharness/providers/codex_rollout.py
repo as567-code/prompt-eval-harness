@@ -18,7 +18,7 @@ from typing import Any
 
 CODEX_SESSIONS_ROOT = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "sessions"
 
-_THREAD_ID_RE = re.compile(r"^[0-9a-f-]{36}$")
+_THREAD_ID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 FAIL_CLOSED_OUTPUTS: frozenset[str] = frozenset({"code-mode host is disabled"})
 _EXCERPT_MAX = 200
 _TEXT_PART_TYPES = ("text", "output_text", "input_text")
@@ -86,7 +86,7 @@ def audit_rollout(path: Path) -> RolloutAudit:
     effort: str | None = None
     # Ordered items: ("call", type, call_id, name) or ("out", type, call_id, text)
     items: list[tuple[str, str, str, str]] = []
-    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+    for raw in path.read_text(encoding="utf-8", errors="replace").split("\n"):
         raw = raw.strip()
         if not raw:
             continue

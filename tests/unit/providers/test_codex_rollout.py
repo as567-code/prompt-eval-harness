@@ -287,3 +287,29 @@ def test_non_string_type_is_anomalous(tmp_path: Path) -> None:
     audit = audit_rollout(_items(tmp_path / "r.jsonl", {"type": 7}))
     assert audit.tool_calls[0].name == "<anomalous>"
     assert audit.real_tool_output is True
+
+
+def test_audit_survives_unicode_line_separators(tmp_path: Path) -> None:
+    p = tmp_path / "r.jsonl"
+    lines = [
+        json.dumps(
+            {
+                "type": "session_meta",
+                "payload": {"cwd": "/w", "base_instructions": "a\u2028b\u0085c"},
+            },
+            ensure_ascii=False,
+        ),
+        _line("turn_context", {"model": "m", "effort": "low"}),
+    ]
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    audit = audit_rollout(p)
+    assert audit.cwd == Path("/w") and audit.model == "m"
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["-" * 36, "g" * 8 + "-" + "0" * 4 + "-" + "0" * 4 + "-" + "0" * 4 + "-" + "0" * 12, "0" * 36],
+)
+def test_find_rollout_strict_uuid(tmp_path: Path, bad: str) -> None:
+    with pytest.raises(ValueError):
+        find_rollout(bad, sessions_root=tmp_path, around=datetime.now())
