@@ -382,7 +382,8 @@ def test_valid_failing_envelope_wins_over_docker_exit_code(tmp_path: Path) -> No
 def _run_candidate(tmp_path: Path, candidate: str | None, **fake: object) -> SandboxResult:
     docker = fake_docker(tmp_path, **fake)  # type: ignore[arg-type]
     runner = SandboxRunner(image_id="sha256:abc", docker=str(docker), timeout_s=30)
-    return runner.run(FILES, test_files=["test_hidden.py"], candidate=candidate)
+    files = dict(FILES) if candidate is None else {**FILES, "solution.py": candidate}
+    return runner.run(files, test_files=["test_hidden.py"], scan_candidate=candidate is not None)
 
 
 def test_forgery_candidate_turns_passed_into_tamper(tmp_path: Path) -> None:
@@ -410,7 +411,7 @@ def test_clean_or_absent_candidate_is_unchanged(tmp_path: Path) -> None:
 def test_forgery_does_not_outrank_timeout_or_sandbox_error(tmp_path: Path) -> None:
     docker = fake_docker(tmp_path, stdout=line(envelope()), sleep=5)
     runner = SandboxRunner(image_id="sha256:abc", docker=str(docker), timeout_s=0.3, grace_s=0.2)
-    res = runner.run(FILES, test_files=["test_hidden.py"], candidate="import ctypes")
+    res = runner.run({**FILES, "solution.py": "import ctypes"}, test_files=["test_hidden.py"])
     assert res.status is SandboxStatus.TIMEOUT
     res2 = _run_candidate(
         tmp_path, "import ctypes", code=125, stderr="Cannot connect to the Docker daemon"
@@ -424,3 +425,20 @@ def test_syntax_error_candidate_is_failed_with_info(tmp_path: Path) -> None:
     assert "syntax_error" in scan("def add(:\n").info
     res = _run_candidate(tmp_path, "def add(:\n", stdout=line(envelope(junit=None, exit_code=1)))
     assert res.status is SandboxStatus.FAILED
+
+
+def test_run_scans_files_solution_without_extra_parameter(tmp_path: Path) -> None:
+    docker = fake_docker(tmp_path, stdout=line(envelope()))
+    runner = SandboxRunner(image_id="sha256:abc", docker=str(docker), timeout_s=30)
+    forged = {**FILES, "solution.py": "import os\nos._exit(0)\n"}
+    assert runner.run(forged, test_files=["test_hidden.py"]).status is (
+        SandboxStatus.TAMPER_SUSPECT
+    )
+    assert runner.run(forged, test_files=["test_hidden.py"], scan_candidate=False).status is (
+        SandboxStatus.PASSED
+    )
+
+
+def test_bom_prefixed_solution_is_scanned_as_the_container_sees_it(tmp_path: Path) -> None:
+    res = _run_candidate(tmp_path, "\ufeffimport os\nos._exit(0)\n", stdout=line(envelope()))
+    assert res.status is SandboxStatus.TAMPER_SUSPECT

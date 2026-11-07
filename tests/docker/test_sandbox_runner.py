@@ -27,9 +27,13 @@ def runner() -> SandboxRunner:
     return SandboxRunner(image_id=IMAGE_ID.read_text(encoding="utf-8").strip(), timeout_s=60)
 
 
-def _run(runner: SandboxRunner, solution: str, tests: str = TESTS) -> SandboxResult:
+def _run(
+    runner: SandboxRunner, solution: str, tests: str = TESTS, *, scan: bool = True
+) -> SandboxResult:
     return runner.run(
-        {"solution.py": solution, "test_hidden.py": tests}, test_files=["test_hidden.py"]
+        {"solution.py": solution, "test_hidden.py": tests},
+        test_files=["test_hidden.py"],
+        scan_candidate=scan,
     )
 
 
@@ -59,7 +63,6 @@ def test_syntax_error_candidate_is_failed_with_info(runner: SandboxRunner) -> No
     res = runner.run(
         {"solution.py": bad, "test_hidden.py": TESTS},
         test_files=["test_hidden.py"],
-        candidate=bad,
     )
     assert res.status is SandboxStatus.FAILED, res
 
@@ -97,7 +100,8 @@ def test_binary_garbage_stdout(runner: SandboxRunner) -> None:
 
 
 def test_os_exit_zero_at_import_is_failed_no_report(runner: SandboxRunner) -> None:
-    res = _run(runner, "import os\nos._exit(0)\n")
+    # Raw container behaviour: bypass the static scan, which would label this TAMPER_SUSPECT.
+    res = _run(runner, "import os\nos._exit(0)\n", scan=False)
     assert res.status is SandboxStatus.FAILED, res
     assert res.detail.startswith("no report")
 
@@ -111,7 +115,7 @@ def test_forged_envelope_print_does_not_pass(runner: SandboxRunner) -> None:
         f"import sys, os\nprint({forged!r})\nsys.stdout.flush()\n"
         f"os.write(1, ({forged!r}+'\\n').encode())\n" + BAD
     )
-    res = _run(runner, sol)
+    res = _run(runner, sol, scan=False)
     assert res.status is SandboxStatus.FAILED, res
     assert res.status is not SandboxStatus.PASSED
 

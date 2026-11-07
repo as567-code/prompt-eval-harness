@@ -175,12 +175,13 @@ class SandboxRunner:
         files: Mapping[str, str],
         *,
         test_files: Sequence[str],
-        candidate: str | None = None,
+        scan_candidate: bool = True,
     ) -> SandboxResult:
-        """Run ``files``; ``candidate`` is the model-written solution text, scanned statically.
+        """Run ``files``; ``files["solution.py"]`` is scanned statically when present.
 
-        A non-empty forgery scan turns an otherwise PASSED or FAILED result into TAMPER_SUSPECT
-        (the container still runs). TIMEOUT, RESOURCE_LIMIT and SANDBOX_ERROR are never masked.
+        The scan reads the exact UTF-8 bytes put in the tar. A non-empty forgery scan turns an
+        otherwise PASSED or FAILED result into TAMPER_SUSPECT (the container still runs).
+        TIMEOUT, RESOURCE_LIMIT and SANDBOX_ERROR are never masked.
         """
         for tf_name in test_files:
             if tf_name not in files:
@@ -189,7 +190,9 @@ class SandboxRunner:
         for tf_name in test_files:
             expected.update(collect_test_ids(tf_name, files[tf_name]))
         tar_bytes = build_tar(files)
-        forgery = scan(candidate).forgery if candidate is not None else ()
+        forgery: tuple[str, ...] = ()
+        if scan_candidate and "solution.py" in files:
+            forgery = scan(files["solution.py"].encode("utf-8")).forgery
         with self._sem:
             return self._run(tar_bytes, expected, forgery)
 
