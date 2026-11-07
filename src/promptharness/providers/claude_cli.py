@@ -21,6 +21,7 @@ from typing import Any
 from promptharness.providers.base import (
     MAX_RAW_BYTES,
     AuthModeError,
+    BillingRiskError,
     CliError,
     CliTimeout,
     Completion,
@@ -134,10 +135,22 @@ def _int(obj: Any, key: str) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
+_USAGE_KEYS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+)
+
+
 def _usage(result: Mapping[str, Any]) -> Usage:
     u = result.get("usage")
     if not isinstance(u, dict):
         raise CliError("usage inconsistent: no usage object", transient=False)
+    for key in _USAGE_KEYS:
+        v = u.get(key)
+        if not isinstance(v, int) or isinstance(v, bool) or v < 0:
+            raise CliError(f"usage inconsistent: {key}={v!r}", transient=False)
     cc = u.get("cache_creation")
     details = u.get("output_tokens_details")
     total_write = u.get("cache_creation_input_tokens")
@@ -181,6 +194,20 @@ def _check_init(init: Mapping[str, Any]) -> None:
     mcp = init.get("mcp_servers")
     if mcp != []:
         raise ToolUseDetected(f"claude init reported mcp_servers: {mcp!r}")
+
+
+def _check_billing(rate: Mapping[str, Any] | None) -> None:
+    """R31: refuse when paid overflow (extra usage) is active or enabled. Absent info: no-op."""
+    if rate is None:
+        return
+    using = rate.get("isUsingOverage") is True
+    enabled = "overageStatus" in rate and rate["overageStatus"] != "rejected"
+    if using or enabled:
+        raise BillingRiskError(
+            "claude paid overflow possible/active; refusing per $0 constraint "
+            f"(isUsingOverage={rate.get('isUsingOverage')!r}, "
+            f"overageStatus={rate.get('overageStatus')!r})"
+        )
 
 
 def _reset_hint(rate: Mapping[str, Any] | None) -> str | None:
@@ -248,20 +275,24 @@ class ClaudeCLIProvider:
         return self._map(req, res, version)
 
     def _map(self, req: CompletionRequest, res: CliResult, version: str) -> Completion:
+        stream = parse_claude_stream(res.stdout)
+        # R32: audit init (auth, tools, mcp) and billing BEFORE any error mapping, so a
+        # timeout or missing result can never mask a safety incident.
+        if stream.init is not None:
+            _check_init(stream.init)
+            _check_billing(stream.rate_limit)
         if res.timed_out:
             raise CliTimeout(f"claude timed out after {req.timeout_s}s")
-        stream = parse_claude_stream(res.stdout)
         result = stream.result
         if result is None:
             why = "output truncated" if res.truncated else f"exit {res.returncode}"
             raise CliError(f"no result event in claude output ({why})", transient=False)
         is_error = result.get("is_error") is True
-        if stream.init is not None:
-            _check_init(stream.init)
-        elif not is_error or result.get("api_error") == "max_output_tokens":
-            raise CliError("no init event; cannot verify subscription auth", transient=False)
-
         cap_hit = is_error and result.get("api_error") == "max_output_tokens"
+        if stream.init is None and (not is_error or cap_hit):
+            raise CliError("no init event; cannot verify subscription auth", transient=False)
+        if result.get("permission_denials"):
+            raise ToolUseDetected(f"permission_denials: {result.get('permission_denials')!r}")
         if is_error and not cap_hit:
             _raise_for_error(result, stream.rate_limit)
         served = _served_model(result, req.model)
@@ -280,8 +311,6 @@ class ClaudeCLIProvider:
             "quota": stream.rate_limit,
         }
         if cap_hit:
-            if result.get("permission_denials"):
-                raise ToolUseDetected(f"permission_denials: {result.get('permission_denials')!r}")
             return Completion(
                 text="",
                 structured=None,

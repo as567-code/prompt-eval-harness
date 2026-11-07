@@ -14,6 +14,7 @@ from promptharness.cost import notional_cost_usd
 from promptharness.providers import codex_cli
 from promptharness.providers.base import (
     AuthModeError,
+    BillingRiskError,
     CliError,
     CliTimeout,
     CompletionRequest,
@@ -703,3 +704,146 @@ def test_work_root_stored_resolved(tmp_path: Path) -> None:
     link.symlink_to(tmp_path)
     p = CodexCLIProvider(work_root=link / "w")
     assert p._work_root == (tmp_path / "w").resolve()
+
+
+# ---- I1 (R31): no paid overflow -------------------------------------------------------
+
+
+def _credits_rollout(credits: Any) -> Callable[[Path], str]:
+    def build(cwd: Path) -> str:
+        lines = []
+        for ln in (FIX / "rollouts" / "ok_terra.jsonl").read_text().splitlines():
+            obj = json.loads(ln)
+            if obj["type"] == "session_meta":
+                obj["payload"]["cwd"] = str(cwd)
+            elif obj["type"] == "event_msg" and obj["payload"].get("type") == "token_count":
+                if credits == "absent":
+                    del obj["payload"]["rate_limits"]["credits"]
+                else:
+                    obj["payload"]["rate_limits"]["credits"] = credits
+            lines.append(json.dumps(obj))
+        return "\n".join(lines) + "\n"
+
+    return build
+
+
+@pytest.mark.parametrize(
+    "credits",
+    [
+        {"has_credits": True, "unlimited": False, "balance": "0"},
+        {"has_credits": False, "unlimited": True, "balance": "0"},
+        {"has_credits": False, "unlimited": False, "balance": "12.50"},
+        {"has_credits": False, "unlimited": False, "balance": 5},
+    ],
+)
+def test_billing_risk_on_credits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, credits: dict[str, Any]
+) -> None:
+    env = _env(tmp_path, monkeypatch, rollout=_credits_rollout(credits))
+    with pytest.raises(BillingRiskError) as ei:
+        env.provider.complete(_req())
+    assert ei.value.error_class == "billing_risk"
+    assert "paid overflow possible/active; refusing per $0 constraint" in str(ei.value)
+    assert env.rollout_path is not None and not env.rollout_path.exists()  # evidence cleaned up
+
+
+@pytest.mark.parametrize("balance", ["0", "0.0", "", 0])
+def test_zero_credit_balance_is_fine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, balance: Any
+) -> None:
+    credits = {"has_credits": False, "unlimited": False, "balance": balance}
+    c = _env(tmp_path, monkeypatch, rollout=_credits_rollout(credits)).provider.complete(_req())
+    assert c.text
+
+
+def test_absent_credits_is_fine(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env = _env(tmp_path, monkeypatch, rollout=_credits_rollout("absent"))
+    assert env.provider.complete(_req()).text
+
+
+def test_billing_risk_on_timeout_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env = _env(
+        tmp_path,
+        monkeypatch,
+        rollout=_credits_rollout({"has_credits": True, "unlimited": False, "balance": "0"}),
+    )
+    real = env._run
+
+    def timed(argv: Sequence[str], **kw: Any) -> CliResult:
+        if list(argv)[1] == "exec":
+            real(argv, **kw)
+            return _cli(_stdout("ok").splitlines()[0] + "\n", rc=None, timed_out=True)
+        return real(argv, **kw)
+
+    monkeypatch.setattr(codex_cli, "run_cli", timed)
+    with pytest.raises(BillingRiskError):
+        env.provider.complete(_req())
+
+
+def test_ownership_checked_before_billing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env = _env(
+        tmp_path,
+        monkeypatch,
+        rollout=_credits_rollout({"has_credits": True, "unlimited": False, "balance": "0"}),
+        rewrite_cwd=False,
+    )
+    # _credits_rollout rewrites cwd itself; point it at a foreign dir instead.
+    env.rollout_src = lambda cwd: _credits_rollout(
+        {"has_credits": True, "unlimited": False, "balance": "0"}
+    )(cwd.parent / "othercall")
+    with pytest.raises(CliError, match="not owned"):
+        env.provider.complete(_req())
+
+
+# ---- M-b: usage-limit reset hint from the rollout ---------------------------------------
+
+
+def test_usage_limit_reset_hint_from_rollout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = Env(
+        tmp_path,
+        monkeypatch,
+        stdout=_err_stdout("You've hit your usage limit. Try again in 2h"),
+        rollout=FIX / "rollouts" / "ok_terra.jsonl",
+    )
+    with pytest.raises(UsageLimitError) as ei:
+        env.provider.complete(_req())
+    assert ei.value.reset_hint == "1794029659"  # earliest of primary/secondary resets_at
+
+
+def test_usage_limit_reset_hint_none_without_rollout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = Env(
+        tmp_path,
+        monkeypatch,
+        stdout=_err_stdout("You've hit your usage limit. Try again in 2h"),
+        rollout=None,
+    )
+    with pytest.raises(UsageLimitError) as ei:
+        env.provider.complete(_req())
+    assert ei.value.reset_hint is None
+
+
+# ---- M-c: cleanup fallbacks are logged ------------------------------------------------
+
+
+def test_delete_failure_logs_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    env = _env(tmp_path, monkeypatch, delete_ok=False)
+    with caplog.at_level("WARNING"):
+        env.provider.complete(_req())
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert "codex delete" in warnings[0].getMessage()
+
+
+def test_clean_delete_logs_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    env = _env(tmp_path, monkeypatch)
+    with caplog.at_level("WARNING"):
+        env.provider.complete(_req())
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]

@@ -9,6 +9,7 @@ import pytest
 
 from promptharness.providers.base import (
     AuthModeError,
+    BillingRiskError,
     CliError,
     CliTimeout,
     CompletionRequest,
@@ -85,6 +86,7 @@ def test_retry_exhaustion_reraises_with_attempts() -> None:
     [
         UsageLimitError("limit", reset_hint="5pm"),
         AuthModeError("api key"),
+        BillingRiskError("overage"),
         ToolUseDetected("Bash"),
         ServedModelMismatch("a", "b"),
         CliTimeout("slow"),
@@ -301,3 +303,46 @@ def test_trip_while_tripped_keeps_closed_and_updates_hint() -> None:
     assert g.reset_hint == "b"
     g.wait_until_open(lambda: True)
     assert g.is_open()
+
+
+# ---- M-a: attempts set on every ProviderError ------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "err",
+    [
+        UsageLimitError("limit"),
+        AuthModeError("key"),
+        BillingRiskError("bill"),
+        ToolUseDetected("Bash"),
+        ServedModelMismatch("a", "b"),
+        CliTimeout("slow"),
+    ],
+)
+def test_attempts_set_for_every_provider_error(err: Exception) -> None:
+    p = FakeProvider([CliError("t", transient=True), err])  # type: ignore[list-item]
+    with pytest.raises(type(err)) as ei:
+        call_with_retry(p, REQ, sleep=Sleeps(), rand=lambda: 0.5)
+    assert ei.value.attempts == 2  # type: ignore[attr-defined]
+
+
+# ---- M-d: rejected windows / reached type count as 1.0 -------------------------------------
+
+
+def test_quota_pressure_rejected_window() -> None:
+    q = {
+        "status": "allowed",
+        "unifiedWindows": {
+            "five_hour": {"utilization": 0.1, "status": "allowed"},
+            "seven_day": {"utilization": 0.2, "status": "rejected"},
+        },
+    }
+    assert quota_pressure(q) == 1.0
+
+
+def test_quota_pressure_codex_limit_reached() -> None:
+    q = {"primary": {"used_percent": 3.0}, "rate_limit_reached_type": "primary"}
+    assert quota_pressure(q) == 1.0
+    assert quota_pressure({"rate_limits": q}) == 1.0
+    q2 = {"primary": {"used_percent": 3.0}, "rate_limit_reached_type": None}
+    assert quota_pressure(q2) == pytest.approx(0.03)

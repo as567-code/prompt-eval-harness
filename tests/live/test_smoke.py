@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
-import json
 import os
-import time
+from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from promptharness.catalog import Catalog, ModelEntry
+from promptharness.providers import codex_cli
 from promptharness.providers.base import CompletionRequest, ToolUseDetected
+from promptharness.providers.codex_rollout import CODEX_SESSIONS_ROOT
 from promptharness.providers.registry import provider_for
 
 pytestmark = [
@@ -62,20 +64,37 @@ def test_tool_bait_is_not_executed(suffix: str, work_root: Path) -> None:
     assert "CANNOT" in completion.text.upper() or completion.tool_attempts <= 1
 
 
-def test_codex_rollouts_cleaned_up(work_root: Path) -> None:
-    sessions = Path.home() / ".codex" / "sessions"
-    root = str(work_root.resolve())
-    cutoff = time.time() - 3600
-    leaked: list[str] = []
-    for path in sessions.rglob("*.jsonl") if sessions.exists() else []:
-        try:
-            if path.stat().st_mtime < cutoff:
-                continue
-            with path.open("rb") as fh:
-                first = fh.readline(1_000_000)
-            cwd = json.loads(first).get("payload", {}).get("cwd")
-        except (OSError, ValueError, AttributeError):
-            continue
-        if isinstance(cwd, str) and (cwd == root or cwd.startswith(root + os.sep)):
-            leaked.append(path.name)
+@pytest.fixture(scope="module")
+def found_rollouts() -> Iterator[list[Path]]:
+    """Record the rollout paths the provider located for OUR thread ids (never scan sessions)."""
+    recorded: list[Path] = []
+    real = codex_cli.find_rollout
+
+    def spy(thread_id: str, **kw: Any) -> Path:
+        path = real(thread_id, **kw)
+        recorded.append(path)
+        return path
+
+    mp = pytest.MonkeyPatch()
+    mp.setattr(codex_cli, "find_rollout", spy)
+    try:
+        yield recorded
+    finally:
+        mp.undo()
+
+
+def test_codex_rollouts_cleaned_up(work_root: Path, found_rollouts: list[Path]) -> None:
+    entry = next(e for e in ENTRIES if e.provider == "codex-cli")
+    req = CompletionRequest(
+        model=entry.id,
+        effort=entry.default_effort,
+        system="You are a terse assistant.",
+        prompt="Reply with exactly: ok",
+        timeout_s=180,
+    )
+    provider_for(entry, work_root=work_root).complete(req)
+    assert found_rollouts, "spy recorded no rollout for our own Codex thread"
+    # Only paths for our own thread ids are ever inspected; nothing else is opened.
+    assert all(CODEX_SESSIONS_ROOT in p.parents for p in found_rollouts)
+    leaked = [str(p) for p in found_rollouts if p.exists()]
     assert not leaked, f"own Codex rollouts not cleaned up: {leaked}"

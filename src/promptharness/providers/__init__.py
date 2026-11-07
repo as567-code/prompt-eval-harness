@@ -2,6 +2,7 @@
 
 from promptharness.providers.base import (
     AuthModeError,
+    BillingRiskError,
     CliError,
     CliTimeout,
     Completion,
@@ -20,6 +21,7 @@ from promptharness.providers.fake import FakeProvider
 
 __all__ = [
     "AuthModeError",
+    "BillingRiskError",
     "ClaudeCLIProvider",
     "CliError",
     "CliTimeout",

@@ -13,7 +13,13 @@ import typer
 
 from promptharness.catalog import Catalog, ModelEntry, UnknownModelError
 from promptharness.cost import notional_cost_usd
-from promptharness.providers.base import CompletionRequest, Provider, ProviderError
+from promptharness.providers.base import (
+    AuthModeError,
+    BillingRiskError,
+    CompletionRequest,
+    Provider,
+    ProviderError,
+)
 from promptharness.providers.control import (
     BudgetExceeded,
     RunBudget,
@@ -49,7 +55,7 @@ def verify_models(
     budget: RunBudget | None = None,
     sleep: Callable[[float], None] = time.sleep,
 ) -> list[VerifyRow]:
-    """Send one tiny request per entry; a failure is a FAIL row, never an abort."""
+    """One tiny request per entry; failures are FAIL rows, auth/billing run-fatal (R33)."""
     if budget is None:
         budget = RunBudget(max_calls=len(entries) * 2, max_notional_usd=1.0)
     rows: list[VerifyRow] = []
@@ -67,6 +73,11 @@ def verify_models(
             budget.charge(calls=0, usd=cost)
         except ProviderError as err:
             rows.append(_fail(entry.id, f"{err.error_class}: {err}"))
+            if isinstance(err, AuthModeError | BillingRiskError):
+                # R33: run-fatal. No further call may go out once billing risk is seen.
+                skipped = f"skipped: {err.error_class}"
+                rows.extend(_fail(e.id, skipped) for e in entries[idx + 1 :])
+                return rows
             continue
         except BudgetExceeded as err:
             detail = f"budget_exceeded: {err}"

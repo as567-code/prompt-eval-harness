@@ -12,6 +12,7 @@ from promptharness.cost import notional_cost_usd
 from promptharness.providers import claude_cli
 from promptharness.providers.base import (
     AuthModeError,
+    BillingRiskError,
     CliError,
     CliTimeout,
     CompletionRequest,
@@ -614,3 +615,153 @@ def test_claude_version_oserror(monkeypatch: pytest.MonkeyPatch) -> None:
         claude_cli.claude_version("claude")
     assert ei.value.transient is False
     claude_cli.claude_version.cache_clear()
+
+
+# ---- I1 (R31): no paid overflow -------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"isUsingOverage": True},
+        {"overageStatus": "allowed"},
+        {"overageStatus": "allowed_warning"},
+        {"overageStatus": "allowed", "isUsingOverage": False},
+    ],
+)
+def test_billing_risk_on_overage(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, patch: dict[str, Any]
+) -> None:
+    with pytest.raises(BillingRiskError) as ei:
+        run_fixture(monkeypatch, tmp_path, rate_limit_patch=patch)
+    assert ei.value.error_class == "billing_risk"
+    assert "paid overflow possible/active; refusing per $0 constraint" in str(ei.value)
+
+
+def test_billing_risk_beats_error_result(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    with pytest.raises(BillingRiskError):
+        run_fixture(
+            monkeypatch,
+            tmp_path,
+            mutate=_err("API Error", api_error_status=500),
+            rate_limit_patch={"isUsingOverage": True},
+        )
+
+
+def test_overage_rejected_is_fine(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    c = run_fixture(
+        monkeypatch,
+        tmp_path,
+        rate_limit_patch={"overageStatus": "rejected", "isUsingOverage": False},
+    )
+    assert c.text
+
+
+def test_no_overage_fields_is_fine(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    prov, _ = make(
+        monkeypatch,
+        tmp_path,
+        cli_result(
+            "\n".join(
+                json.dumps(x)
+                for x in [
+                    _stream_lines()[0],
+                    {"type": "rate_limit_event", "rate_limit_info": {"status": "allowed"}},
+                    _result_fixture("ok_haiku.json"),
+                ]
+            )
+        ),
+    )
+    assert prov.complete(req()).text
+
+
+def test_billing_check_skipped_without_rate_limit_info(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    stdout = "\n".join(
+        json.dumps(x) for x in [_stream_lines()[0], _result_fixture("ok_haiku.json")]
+    )
+    prov, _ = make(monkeypatch, tmp_path, cli_result(stdout))
+    assert prov.complete(req()).text
+
+
+# ---- I2 (R32): init audit before timeout / missing-result mappings ---------------------
+
+
+def _init_only(**patch: Any) -> str:
+    init = next(
+        ln for ln in _stream_lines() if ln.get("type") == "system" and ln.get("subtype") == "init"
+    )
+    return json.dumps({**init, **patch}) + "\n"
+
+
+def test_timeout_with_api_key_auth_is_auth_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prov, _ = make(
+        monkeypatch,
+        tmp_path,
+        cli_result(_init_only(apiKeySource="ANTHROPIC_API_KEY"), rc=None, timed_out=True),
+    )
+    with pytest.raises(AuthModeError):
+        prov.complete(req())
+
+
+def test_timeout_with_overage_is_billing_risk(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    rate = next(ln for ln in _stream_lines() if ln.get("type") == "rate_limit_event")
+    rate["rate_limit_info"]["isUsingOverage"] = True
+    stdout = _init_only() + json.dumps(rate) + "\n"
+    prov, _ = make(monkeypatch, tmp_path, cli_result(stdout, rc=None, timed_out=True))
+    with pytest.raises(BillingRiskError):
+        prov.complete(req())
+
+
+def test_timeout_with_clean_init_is_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prov, _ = make(monkeypatch, tmp_path, cli_result(_init_only(), rc=None, timed_out=True))
+    with pytest.raises(CliTimeout):
+        prov.complete(req())
+
+
+def test_no_result_with_tools_in_init_is_tool_use(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    prov, _ = make(monkeypatch, tmp_path, cli_result(_init_only(tools=["Bash"]), rc=1))
+    with pytest.raises(ToolUseDetected):
+        prov.complete(req())
+
+
+def test_error_result_permission_denials_is_tool_use(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    with pytest.raises(ToolUseDetected):
+        run_fixture(
+            monkeypatch,
+            tmp_path,
+            mutate=_err("some error", permission_denials=[{"tool_name": "Bash"}]),
+        )
+
+
+# ---- I5: strict usage keys ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"],
+)
+@pytest.mark.parametrize("bad", ["missing", -1, True, 1.5, "3"])
+def test_usage_keys_strict(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, key: str, bad: Any
+) -> None:
+    def mutate(o: dict[str, Any]) -> None:
+        if bad == "missing":
+            del o["usage"][key]
+        else:
+            o["usage"][key] = bad
+
+    with pytest.raises(CliError, match="usage inconsistent") as ei:
+        run_fixture(monkeypatch, tmp_path, mutate=mutate)
+    assert ei.value.transient is False

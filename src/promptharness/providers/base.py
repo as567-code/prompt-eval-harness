@@ -72,6 +72,12 @@ class AuthModeError(ProviderError):
     error_class = "api_key_auth"
 
 
+class BillingRiskError(ProviderError):
+    """Paid overflow (overage / credits) is possible or active; $0 constraint (R31)."""
+
+    error_class = "billing_risk"
+
+
 class Status(enum.StrEnum):
     OK = "ok"
     TRUNCATED = "truncated"

@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import json
+import logging
 import re
 import shutil
 import tempfile
@@ -23,6 +24,7 @@ from typing import Any
 from promptharness.providers.base import (
     MAX_RAW_BYTES,
     AuthModeError,
+    BillingRiskError,
     CliError,
     CliTimeout,
     Completion,
@@ -226,6 +228,38 @@ def _rollout_quota(path: Path) -> Mapping[str, object] | None:
     return quota
 
 
+_NO_BALANCE = frozenset({"0", "0.0", ""})
+
+
+def _check_billing(quota: Mapping[str, object] | None) -> None:
+    """R31: refuse when the ChatGPT account has credits that could fund paid overflow."""
+    credits = quota.get("credits") if quota is not None else None
+    if not isinstance(credits, dict):
+        return
+    if (
+        credits.get("has_credits") is True
+        or credits.get("unlimited") is True
+        or str(credits.get("balance")) not in _NO_BALANCE
+    ):
+        raise BillingRiskError(
+            f"codex paid overflow possible/active; refusing per $0 constraint (credits={credits!r})"
+        )
+
+
+def _earliest_reset(quota: Mapping[str, object] | None) -> str | None:
+    """Earliest ``resets_at`` across the rate-limit windows, as a string, or None."""
+    if quota is None:
+        return None
+    found = [
+        w["resets_at"]
+        for w in quota.values()
+        if isinstance(w, dict)
+        and isinstance(w.get("resets_at"), int | float)
+        and not isinstance(w.get("resets_at"), bool)
+    ]
+    return str(min(found)) if found else None
+
+
 class CodexCLIProvider:
     name = "codex-cli"
 
@@ -328,7 +362,8 @@ class CodexCLIProvider:
         """Delete our own rollout (``codex delete --force``, else unlink); never anything else."""
         if not self._owned(audit, workdir):
             return
-        with contextlib.suppress(Exception):  # cleanup must never mask the call result
+        reason = ""
+        try:  # cleanup must never mask the call result
             res = run_cli(
                 [self._binary, "delete", "--force", "--", thread_id],
                 cwd=Path(tempfile.gettempdir()),
@@ -336,16 +371,23 @@ class CodexCLIProvider:
             )
             if res.returncode == 0 and not res.timed_out and not audit.path.exists():
                 return
+            reason = f"exit {res.returncode}, timed_out={res.timed_out}"
+        except Exception as exc:
+            reason = f"{type(exc).__name__}: {exc}"
+        logging.getLogger(__name__).warning(
+            "codex delete failed for thread %s (%s); falling back to unlink", thread_id, reason
+        )
         with contextlib.suppress(OSError):
             delete_own_rollout(audit, own_root=self._work_root)
 
     def _audit_checks(self, req: CompletionRequest, audit: RolloutAudit, workdir: Path) -> None:
-        """Rollout evidence checks, in order: ownership, tool use, served model, effort.
+        """Rollout evidence checks, in order: ownership, billing, tool use, model, effort.
 
         Run before ANY error, exit-code or timeout mapping: stdout hides tool calls.
         """
         if not self._owned(audit, workdir):
             raise CliError("rollout not owned by this call", transient=False)
+        _check_billing(_rollout_quota(audit.path))
         if audit.real_tool_output:
             raise ToolUseDetected(
                 "codex tool output: "
@@ -373,7 +415,8 @@ class CodexCLIProvider:
         if not events.messages:
             for msg in events.errors:
                 if _USAGE_LIMIT_RE.search(msg):
-                    raise UsageLimitError(msg)
+                    hint = _earliest_reset(_rollout_quota(audit.path)) if audit else None
+                    raise UsageLimitError(msg, reset_hint=hint)
             if events.errors:
                 msg = "; ".join(events.errors)
                 raise CliError(msg, transient=bool(_TRANSIENT_RE.search(msg)))

@@ -12,12 +12,14 @@ from dataclasses import dataclass
 
 from promptharness.providers.base import (
     AuthModeError,
+    BillingRiskError,
     CliError,
     CliTimeout,
     Completion,
     CompletionRequest,
     Effort,
     Provider,
+    ProviderError,
     ServedModelMismatch,
     ToolUseDetected,
     UsageLimitError,
@@ -25,7 +27,14 @@ from promptharness.providers.base import (
 
 QUOTA_PAUSE_THRESHOLD = 0.85
 
-_NEVER_RETRY = (UsageLimitError, AuthModeError, ToolUseDetected, ServedModelMismatch, CliTimeout)
+_NEVER_RETRY = (
+    UsageLimitError,
+    AuthModeError,
+    BillingRiskError,
+    ToolUseDetected,
+    ServedModelMismatch,
+    CliTimeout,
+)
 
 
 class BudgetExceeded(Exception):
@@ -61,8 +70,9 @@ def call_with_retry(
         n += 1
         try:
             completion = provider.complete(req)
-        except CliError as err:
-            if isinstance(err, _NEVER_RETRY) or not err.transient or n >= max_attempts:
+        except ProviderError as err:
+            transient = isinstance(err, CliError) and err.transient
+            if not transient or isinstance(err, _NEVER_RETRY) or n >= max_attempts:
                 err.attempts = n
                 raise
         else:
@@ -170,12 +180,16 @@ def quota_pressure(quota: Mapping[str, object] | None) -> float | None:
             quota = inner
             break
     found: list[float] = []
-    if quota.get("status") == "rejected":
+    if quota.get("status") == "rejected" or quota.get("rate_limit_reached_type") is not None:
         found.append(1.0)
     windows = quota.get("unifiedWindows")
     if isinstance(windows, Mapping):
         for w in windows.values():
-            u = _num(w.get("utilization")) if isinstance(w, Mapping) else None
+            if not isinstance(w, Mapping):
+                continue
+            if w.get("status") == "rejected":
+                found.append(1.0)
+            u = _num(w.get("utilization"))
             if u is not None:
                 found.append(u)
     for w in quota.values():

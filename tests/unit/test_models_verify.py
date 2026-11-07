@@ -7,7 +7,13 @@ import promptharness.models_cli as models_cli
 from promptharness.catalog import Catalog, ModelEntry
 from promptharness.cli import app
 from promptharness.models_cli import verify_models
-from promptharness.providers.base import CliError, Provider, ServedModelMismatch
+from promptharness.providers.base import (
+    AuthModeError,
+    BillingRiskError,
+    CliError,
+    Provider,
+    ServedModelMismatch,
+)
 from promptharness.providers.claude_cli import ClaudeCLIProvider
 from promptharness.providers.codex_cli import CodexCLIProvider
 from promptharness.providers.control import RunBudget
@@ -149,3 +155,26 @@ def test_budget_accounting() -> None:
     assert attempts["n"] == len(entries) + 1
     assert budget.calls_used == attempts["n"]
     assert budget.usd_used == pytest.approx(sum(r.notional_usd for r in rows))
+
+
+@pytest.mark.parametrize(
+    ("err", "cls"),
+    [(AuthModeError("api key"), "api_key_auth"), (BillingRiskError("overage"), "billing_risk")],
+)
+def test_run_fatal_error_skips_remaining(err: Exception, cls: str) -> None:
+    entries = Catalog.load(CATALOG).by_role("pool")[:3]
+    assert len(entries) == 3
+    providers: list[FakeProvider] = []
+
+    def factory(entry: ModelEntry) -> Provider:
+        p = FakeProvider([err, FakeProvider.text("ok", model=entry.id)])  # type: ignore[list-item]
+        providers.append(p)
+        return p
+
+    rows = verify_models(entries, factory, sleep=lambda _s: None)
+    assert len(providers) == 1  # factory never reached for the skipped entries
+    assert sum(len(p.requests) for p in providers) == 1
+    assert [r.model for r in rows] == [e.id for e in entries]
+    assert all(r.status == "FAIL" for r in rows)
+    assert rows[0].detail.startswith(f"{cls}: ")
+    assert [r.detail for r in rows[1:]] == [f"skipped: {cls}"] * 2
