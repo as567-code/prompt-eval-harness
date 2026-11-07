@@ -70,6 +70,7 @@ def fake_docker(
     script.write_text(
         "#!/bin/sh\n"
         f'if [ "$1" = "kill" ]; then printf "%s\\n" "$@" > "{tmp_path}/kill.txt"; exit 0; fi\n'
+        f'if [ "$1" = "rm" ]; then printf "%s\\n" "$@" > "{tmp_path}/rm.txt"; exit 0; fi\n'
         f'printf "%s\\n" "$@" > "{tmp_path}/argv.txt"\n'
         f'cat > "{tmp_path}/stdin.tar"\n'
         f"sleep {sleep}\n"
@@ -254,6 +255,7 @@ def test_host_timeout_kills_container_and_returns_timeout(tmp_path: Path) -> Non
     kill = (tmp_path / "kill.txt").read_text().split()
     assert kill[0] == "kill"
     assert kill[1].startswith("peh-")
+    assert (tmp_path / "rm.txt").read_text().split() == ["rm", "-f", kill[1]]
     argv = (tmp_path / "argv.txt").read_text().split()
     assert argv[argv.index("--name") + 1] == kill[1]
 
@@ -375,3 +377,42 @@ def test_valid_envelope_wins_over_infra_stderr(tmp_path: Path) -> None:
 def test_valid_failing_envelope_wins_over_docker_exit_code(tmp_path: Path) -> None:
     res = run_with(tmp_path, stdout=line(envelope(1, JUNIT_FAIL)), code=125)
     assert res.status is SandboxStatus.FAILED
+
+
+def _run_candidate(tmp_path: Path, candidate: str | None, **fake: object) -> SandboxResult:
+    docker = fake_docker(tmp_path, **fake)  # type: ignore[arg-type]
+    runner = SandboxRunner(image_id="sha256:abc", docker=str(docker), timeout_s=30)
+    return runner.run(FILES, test_files=["test_hidden.py"], candidate=candidate)
+
+
+def test_forgery_candidate_turns_passed_into_tamper(tmp_path: Path) -> None:
+    res = _run_candidate(tmp_path, "import os\nos._exit(0)\n", stdout=line(envelope()))
+    assert res.status is SandboxStatus.TAMPER_SUSPECT
+    assert "_exit" in res.detail
+    assert (tmp_path / "argv.txt").exists()  # the container still ran
+
+
+def test_forgery_candidate_turns_failed_into_tamper(tmp_path: Path) -> None:
+    res = _run_candidate(
+        tmp_path, "x = 'report.xml'", stdout=line(envelope(junit=None, exit_code=1))
+    )
+    assert res.status is SandboxStatus.TAMPER_SUSPECT
+    assert "report.xml" in res.detail
+
+
+def test_clean_or_absent_candidate_is_unchanged(tmp_path: Path) -> None:
+    assert _run_candidate(tmp_path, "x = 1\n", stdout=line(envelope())).status is (
+        SandboxStatus.PASSED
+    )
+    assert _run_candidate(tmp_path, None, stdout=line(envelope())).status is SandboxStatus.PASSED
+
+
+def test_forgery_does_not_outrank_timeout_or_sandbox_error(tmp_path: Path) -> None:
+    docker = fake_docker(tmp_path, stdout=line(envelope()), sleep=5)
+    runner = SandboxRunner(image_id="sha256:abc", docker=str(docker), timeout_s=0.3, grace_s=0.2)
+    res = runner.run(FILES, test_files=["test_hidden.py"], candidate="import ctypes")
+    assert res.status is SandboxStatus.TIMEOUT
+    res2 = _run_candidate(
+        tmp_path, "import ctypes", code=125, stderr="Cannot connect to the Docker daemon"
+    )
+    assert res2.status is SandboxStatus.SANDBOX_ERROR
