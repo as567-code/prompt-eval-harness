@@ -66,6 +66,12 @@ class ToolUseDetected(ProviderError):
         self.detail = detail
 
 
+class AuthModeError(ProviderError):
+    """The CLI is not on subscription auth, so a call could bill real money."""
+
+    error_class = "api_key_auth"
+
+
 class Status(enum.StrEnum):
     OK = "ok"
     TRUNCATED = "truncated"
@@ -111,6 +117,7 @@ class Completion:
     cli_version: str
     provider: str
     raw: str  # callers cap at MAX_RAW_BYTES (1 MB)
+    quota: Mapping[str, object] | None = None
 
 
 class Provider(Protocol):

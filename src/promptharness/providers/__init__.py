@@ -1,6 +1,7 @@
 """LLM providers (CLI-backed and fake)."""
 
 from promptharness.providers.base import (
+    AuthModeError,
     CliError,
     CliTimeout,
     Completion,
@@ -14,9 +15,12 @@ from promptharness.providers.base import (
     ToolUseDetected,
     UsageLimitError,
 )
+from promptharness.providers.claude_cli import ClaudeCLIProvider
 from promptharness.providers.fake import FakeProvider
 
 __all__ = [
+    "AuthModeError",
+    "ClaudeCLIProvider",
     "CliError",
     "CliTimeout",
     "Completion",
