@@ -45,7 +45,6 @@ def build_claude_argv(req: CompletionRequest, *, binary: str = "claude") -> list
     argv = [
         binary,
         "-p",
-        req.prompt,
         "--model",
         req.model,
         "--effort",
@@ -55,15 +54,17 @@ def build_claude_argv(req: CompletionRequest, *, binary: str = "claude") -> list
         "--strict-mcp-config",
         "--setting-sources",
         "",
-        "--system-prompt",
-        req.system,
+        f"--system-prompt={req.system}",
         "--output-format",
         "stream-json",
         "--verbose",
         "--no-session-persistence",
     ]
     if req.json_schema is not None:
-        argv += ["--json-schema", json.dumps(req.json_schema, sort_keys=True)]
+        argv.append(f"--json-schema={json.dumps(req.json_schema, sort_keys=True)}")
+    # R19: model/case text is data. Option values use the --opt=value form; the prompt
+    # follows a literal "--" so flag-like text can never be parsed as an option.
+    argv += ["--", req.prompt]
     return argv
 
 
@@ -76,7 +77,7 @@ class ClaudeStream:
 
 def _events(stdout: str) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
-    for line in stdout.splitlines():
+    for line in stdout.split("\n"):
         line = line.strip()
         if not line.startswith("{"):
             continue  # preamble or noise
@@ -116,9 +117,12 @@ def parse_claude_output(stdout: str) -> dict[str, object]:
 @functools.cache
 def claude_version(binary: str) -> str:
     """``claude --version``, run once per process per binary (failures are not cached)."""
-    res = run_cli(
-        [binary, "--version"], cwd=Path(tempfile.gettempdir()), timeout_s=_VERSION_TIMEOUT_S
-    )
+    try:
+        res = run_cli(
+            [binary, "--version"], cwd=Path(tempfile.gettempdir()), timeout_s=_VERSION_TIMEOUT_S
+        )
+    except OSError as exc:
+        raise CliError(f"{binary} --version could not run: {exc}", transient=False) from exc
     text = res.stdout.strip()
     if res.timed_out or res.returncode != 0 or not text:
         raise CliError(f"{binary} --version failed", transient=False)
@@ -132,15 +136,25 @@ def _int(obj: Any, key: str) -> int:
 
 def _usage(result: Mapping[str, Any]) -> Usage:
     u = result.get("usage")
-    u = u if isinstance(u, dict) else {}
+    if not isinstance(u, dict):
+        raise CliError("usage inconsistent: no usage object", transient=False)
     cc = u.get("cache_creation")
     details = u.get("output_tokens_details")
+    total_write = u.get("cache_creation_input_tokens")
+    if isinstance(cc, dict):
+        w5, w1 = _int(cc, "ephemeral_5m_input_tokens"), _int(cc, "ephemeral_1h_input_tokens")
+        if isinstance(total_write, int) and total_write != w5 + w1:
+            raise CliError("usage inconsistent: cache write buckets differ", transient=False)
+    elif isinstance(total_write, int) and total_write > 0:
+        raise CliError("usage inconsistent: cache writes without breakdown", transient=False)
+    else:
+        w5 = w1 = 0
     return Usage(
         input=_int(u, "input_tokens"),
         output=_int(u, "output_tokens"),
         cache_read=_int(u, "cache_read_input_tokens"),
-        cache_write_5m=_int(cc, "ephemeral_5m_input_tokens"),
-        cache_write_1h=_int(cc, "ephemeral_1h_input_tokens"),
+        cache_write_5m=w5,
+        cache_write_1h=w1,
         reasoning=_int(details, "thinking_tokens"),
     )
 
@@ -164,18 +178,21 @@ def _check_init(init: Mapping[str, Any]) -> None:
     tools = init.get("tools")
     if tools != []:
         raise ToolUseDetected(f"claude init reported tools: {tools!r}")
+    mcp = init.get("mcp_servers")
+    if mcp != []:
+        raise ToolUseDetected(f"claude init reported mcp_servers: {mcp!r}")
 
 
 def _reset_hint(rate: Mapping[str, Any] | None) -> str | None:
-    if rate is not None and rate.get("resetsAt") is not None:
+    if rate is not None and rate.get("status") == "rejected" and rate.get("resetsAt") is not None:
         return str(rate["resetsAt"])
     return None
 
 
 def _raise_for_error(result: Mapping[str, Any], rate: Mapping[str, Any] | None) -> None:
     text = str(result.get("result") or "")
-    if rate is not None and rate.get("status") != "allowed":
-        raise UsageLimitError(text or "rate limit not allowed", reset_hint=_reset_hint(rate))
+    if rate is not None and rate.get("status") == "rejected":
+        raise UsageLimitError(text or "rate limit rejected", reset_hint=_reset_hint(rate))
     if _USAGE_LIMIT_RE.search(text):
         raise UsageLimitError(text, reset_hint=_reset_hint(rate))
     status = result.get("api_error_status")
@@ -241,15 +258,12 @@ class ClaudeCLIProvider:
         is_error = result.get("is_error") is True
         if stream.init is not None:
             _check_init(stream.init)
-        elif not is_error:
+        elif not is_error or result.get("api_error") == "max_output_tokens":
             raise CliError("no init event; cannot verify subscription auth", transient=False)
 
         cap_hit = is_error and result.get("api_error") == "max_output_tokens"
         if is_error and not cap_hit:
             _raise_for_error(result, stream.rate_limit)
-        if not is_error and res.returncode != 0:
-            raise CliError(f"claude exited {res.returncode} with a success result", transient=False)
-
         served = _served_model(result, req.model)
         usage = _usage(result)
         api_ms = result.get("duration_api_ms")
@@ -273,10 +287,12 @@ class ClaudeCLIProvider:
                 structured=None,
                 status=Status.TRUNCATED,
                 stop_reason=_str_or_none(result.get("stop_reason")),
-                output_cap_applied=True,
+                output_cap_applied=req.max_output_tokens is not None,
                 **common,
             )
         structured = _audit_tools(result, schema=req.json_schema is not None)
+        if not is_error and res.returncode != 0:
+            raise CliError(f"claude exited {res.returncode} with a success result", transient=False)
         stop = _str_or_none(result.get("stop_reason"))
         status = {"max_tokens": Status.TRUNCATED, "refusal": Status.REFUSAL}.get(
             stop or "", Status.OK

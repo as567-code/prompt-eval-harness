@@ -123,24 +123,53 @@ def run_fixture(
 
 
 def test_argv_shape() -> None:
-    argv = build_claude_argv(req(prompt="--bare weird"))
-    assert "--bare" not in argv[:2] + argv[3:]
+    argv = build_claude_argv(req(prompt="--bare weird", system="--tools default"))
+    assert "--bare" not in argv
     assert "--fallback-model" not in argv
     assert argv[argv.index("--tools") + 1] == ""
+    assert argv[:2] == ["claude", "-p"]
+    assert argv[-2] == "--"
+    assert argv[-1] == "--bare weird"
     assert argv.count("--bare weird") == 1
-    assert argv[:3] == ["claude", "-p", "--bare weird"]
+    before = argv[:-2]
+    assert "--bare weird" not in before
+    assert "--system-prompt=--tools default" in before
+    assert "--tools default" not in before
     assert argv[argv.index("--output-format") + 1] == "stream-json"
-    assert "--verbose" in argv
-    assert argv[-1] == "--no-session-persistence"
-    assert "--json-schema" not in argv
+    assert "--verbose" in before
+    assert "--no-session-persistence" in before
+    assert not any(a.startswith("--json-schema") for a in argv)
     assert argv[argv.index("--setting-sources") + 1] == ""
-    assert argv[argv.index("--system-prompt") + 1] == "sys"
+
+
+@pytest.mark.parametrize("prompt", ["--bare", '--settings={"x": 1}', "--model=x"])
+def test_flag_like_prompt_stays_after_double_dash(prompt: str) -> None:
+    argv = build_claude_argv(req(prompt=prompt))
+    assert argv[-2:] == ["--", prompt]
+    assert argv.count(prompt) == 1
 
 
 def test_argv_schema_appended() -> None:
-    argv = build_claude_argv(req(json_schema=SCHEMA), binary="/x/claude")
+    argv = build_claude_argv(req(json_schema=SCHEMA, prompt="p"), binary="/x/claude")
     assert argv[0] == "/x/claude"
-    assert argv[-2:] == ["--json-schema", json.dumps(SCHEMA, sort_keys=True)]
+    assert f"--json-schema={json.dumps(SCHEMA, sort_keys=True)}" in argv[:-2]
+    assert argv[-2:] == ["--", "p"]
+
+
+@pytest.mark.parametrize(
+    "name", ["ok_haiku.json", "schema_haiku.json", "toolbait_haiku.json", "cap_haiku.json"]
+)
+def test_cost_parity_all_fixtures(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, name: str
+) -> None:
+    obj = _result_fixture(name)
+    rc = 1 if obj["is_error"] else 0
+    schema = SCHEMA if "structured_output" in obj else None
+    prov, _ = make(monkeypatch, tmp_path, cli_result(compose_stream(obj), rc=rc))
+    c = prov.complete(req(json_schema=schema, max_output_tokens=64 if rc else None))
+    assert notional_cost_usd(c.usage_gross, CATALOG.get(MODEL)) == pytest.approx(
+        obj["total_cost_usd"], rel=1e-6
+    )
 
 
 def test_ok_fixture_maps_usage(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -488,4 +517,100 @@ def test_claude_version_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     claude_cli.claude_version.cache_clear()
     with pytest.raises(CliError):
         claude_cli.claude_version("claude")
+    claude_cli.claude_version.cache_clear()
+
+
+def test_unicode_line_separators_in_result(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    obj = _result_fixture("ok_haiku.json")
+    obj["result"] = "a\u2028b\u2029c\u0085d"
+    stdout = "\n".join(
+        json.dumps(x, ensure_ascii=False) for x in [_stream_lines()[0], _stream_lines()[2], obj]
+    )
+    assert "\u2028" in stdout
+    prov, _ = make(monkeypatch, tmp_path, cli_result(stdout))
+    assert prov.complete(req()).text == "a\u2028b\u2029c\u0085d"
+
+
+def test_cap_hit_without_init_is_cli_error(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    obj = _result_fixture("cap_haiku.json")
+    prov, _ = make(monkeypatch, tmp_path, cli_result(compose_stream(obj, with_init=False), rc=1))
+    with pytest.raises(CliError) as ei:
+        prov.complete(req(max_output_tokens=64))
+    assert ei.value.transient is False
+
+
+def test_usage_missing_is_cli_error(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    def drop(o: dict[str, Any]) -> None:
+        del o["usage"]
+
+    with pytest.raises(CliError, match="usage inconsistent"):
+        run_fixture(monkeypatch, tmp_path, mutate=drop)
+
+
+def test_cache_creation_removed_is_cli_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def drop(o: dict[str, Any]) -> None:
+        del o["usage"]["cache_creation"]
+
+    with pytest.raises(CliError, match="usage inconsistent"):
+        run_fixture(monkeypatch, tmp_path, mutate=drop)
+
+
+def test_cache_buckets_must_sum(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    def bump(o: dict[str, Any]) -> None:
+        o["usage"]["cache_creation_input_tokens"] += 5
+
+    with pytest.raises(CliError, match="usage inconsistent"):
+        run_fixture(monkeypatch, tmp_path, mutate=bump)
+
+
+def test_init_mcp_servers_is_tool_use(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    with pytest.raises(ToolUseDetected):
+        run_fixture(monkeypatch, tmp_path, init_patch={"mcp_servers": [{"name": "x"}]})
+
+
+def test_allowed_warning_529_is_transient_cli_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    with pytest.raises(CliError) as ei:
+        run_fixture(
+            monkeypatch,
+            tmp_path,
+            mutate=_err("API Error", api_error_status=529),
+            rate_limit_patch={"status": "allowed_warning"},
+        )
+    assert type(ei.value) is CliError
+    assert ei.value.transient is True
+
+
+def test_regex_usage_limit_reset_hint_only_when_rejected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    with pytest.raises(UsageLimitError) as ei:
+        run_fixture(monkeypatch, tmp_path, mutate=_err("usage limit reached"))
+    assert ei.value.reset_hint is None
+
+
+def test_safety_incident_not_masked_by_nonzero_exit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    obj = _result_fixture("ok_haiku.json")
+    obj["num_turns"] = 3
+    prov, _ = make(monkeypatch, tmp_path, cli_result(compose_stream(obj), rc=1))
+    with pytest.raises(ToolUseDetected):
+        prov.complete(req())
+
+
+def test_claude_version_oserror(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.undo()
+
+    def boom(argv: list[str], **kw: Any) -> CliResult:
+        raise FileNotFoundError("claude")
+
+    monkeypatch.setattr(claude_cli, "run_cli", boom)
+    claude_cli.claude_version.cache_clear()
+    with pytest.raises(CliError) as ei:
+        claude_cli.claude_version("claude")
+    assert ei.value.transient is False
     claude_cli.claude_version.cache_clear()
