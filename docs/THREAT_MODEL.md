@@ -51,7 +51,7 @@ All tests are in `tests/adversarial/` and are marked `docker` and `adversarial`.
 - **Scan trade-offs (R39).** Calls to `exec`, `eval` and `compile` (bare, or via `builtins`/`__builtins__`) are forgery (`dynamic_exec`); honest dataset solutions do not need them, and they would otherwise defeat every other pattern. `kill`/`killpg` are forgery only when the base is the `os` module or an alias (`import os as o`, `from os import kill`), so `proc.kill()` and `self.kill()` stay clean; `_exit` is flagged on any base. `os` and `sys` import aliases are resolved. The `junit` string rule ignores docstrings and bare expression-statement strings, to avoid flagging honest documentation; a `report.xml` string is flagged everywhere. The cost: a solution that legitimately mentions `junit` in a real string literal, or calls `exec`/`eval`/`compile`, is graded `TAMPER_SUSPECT`.
 - **Known static-scan evasions (best-effort grading).** None of these is detected statically:
   - `getattr(builtins, "exec")`, `__builtins__["exec"]`, and `getattr` with a concatenated `_exit`;
-  - an alias assigned after import (`o = os`) and `from sys import modules as m`;
+  - an alias assigned after import. `o = os` hides `o.kill(...)` from the os-narrowed kill rule. This is harmless, since a kill cannot yield PASSED (see below); `_exit` and the `exec*` family are flagged on any base. `m = sys.modules` followed by `m[...] = ...` hides a `sys.modules` write. (`from sys import modules as m` *is* flagged.)
   - a `report.xml` path built by string concatenation;
   - `importlib.import_module` with a concatenated module name, for example `"_py" + "test.reports"`;
   - a subprocess shell that writes the report (`subprocess.run("echo ... > /work/rep" + "ort.xml", shell=True)`).
