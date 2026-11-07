@@ -21,6 +21,7 @@ from promptharness.sandbox.junit import (
     TestOutcome,
     parse_junit,
 )
+from promptharness.sandbox.tamper import scan
 from promptharness.sandbox.testids import collect_test_ids
 from promptharness.security import safe_env
 
@@ -169,7 +170,18 @@ class SandboxRunner:
             self._image_id,
         ]  # fmt: skip
 
-    def run(self, files: Mapping[str, str], *, test_files: Sequence[str]) -> SandboxResult:
+    def run(
+        self,
+        files: Mapping[str, str],
+        *,
+        test_files: Sequence[str],
+        candidate: str | None = None,
+    ) -> SandboxResult:
+        """Run ``files``; ``candidate`` is the model-written solution text, scanned statically.
+
+        A non-empty forgery scan turns an otherwise PASSED or FAILED result into TAMPER_SUSPECT
+        (the container still runs). TIMEOUT, RESOURCE_LIMIT and SANDBOX_ERROR are never masked.
+        """
         for tf_name in test_files:
             if tf_name not in files:
                 raise ValueError(f"test file {tf_name!r} is not in files")
@@ -177,8 +189,9 @@ class SandboxRunner:
         for tf_name in test_files:
             expected.update(collect_test_ids(tf_name, files[tf_name]))
         tar_bytes = build_tar(files)
+        forgery = scan(candidate).forgery if candidate is not None else ()
         with self._sem:
-            return self._run(tar_bytes, expected)
+            return self._run(tar_bytes, expected, forgery)
 
     def _result(
         self,
@@ -202,17 +215,22 @@ class SandboxRunner:
         )
 
     def _kill(self, name: str) -> None:
-        with suppress(OSError, subprocess.SubprocessError):
-            subprocess.run(  # noqa: S603
-                [self._docker, "kill", name],
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                timeout=10,
-                check=False,
-                env=safe_env(),
-            )
+        # `docker kill` stops it; `docker rm -f` then waits for removal, so no peh- container
+        # outlives the call even when `--rm` cleanup is slow (for example after a fork bomb).
+        for sub in (["kill", name], ["rm", "-f", name]):
+            with suppress(OSError, subprocess.SubprocessError):
+                subprocess.run(  # noqa: S603
+                    [self._docker, *sub],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    timeout=15,
+                    check=False,
+                    env=safe_env(),
+                )
 
-    def _run(self, tar_bytes: bytes, expected: set[str]) -> SandboxResult:
+    def _run(
+        self, tar_bytes: bytes, expected: set[str], forgery: tuple[str, ...] = ()
+    ) -> SandboxResult:
         name = f"peh-{uuid.uuid4().hex}"
         start = time.monotonic()
         try:
@@ -262,6 +280,9 @@ class SandboxRunner:
         def done(
             status: SandboxStatus, detail: str, outcomes: Sequence[TestOutcome] = ()
         ) -> SandboxResult:
+            if forgery and status in (SandboxStatus.PASSED, SandboxStatus.FAILED):
+                detail = f"forgery scan: {', '.join(forgery)}" + (f"; {detail}" if detail else "")
+                status = SandboxStatus.TAMPER_SUSPECT
             return self._result(
                 status,
                 start,
