@@ -9,6 +9,8 @@ from typing import Any
 
 import pytest
 
+from promptharness.catalog import Catalog
+from promptharness.cost import notional_cost_usd
 from promptharness.providers import codex_cli
 from promptharness.providers.base import (
     AuthModeError,
@@ -29,6 +31,7 @@ from promptharness.providers.subprocess_runner import CliResult
 
 FIX = Path(__file__).parents[2] / "fixtures" / "cli" / "codex"
 MODEL = "gpt-6.1-terra"
+CATALOG = Catalog.load(Path(__file__).parents[3] / "config" / "models.yaml")
 LOGIN_OK = (FIX / "login_status.txt").read_text()
 
 
@@ -468,6 +471,7 @@ def test_usage_cache_write_is_subset_of_input(
         10,
     )
     assert g.input_side == 1000
+    assert notional_cost_usd(g, CATALOG.get(MODEL)) == pytest.approx(0.000965, rel=1e-6)
 
 
 _GOOD = {
@@ -634,3 +638,68 @@ def test_missing_rollout_is_cli_error(tmp_path: Path, monkeypatch: pytest.Monkey
     env = _env(tmp_path, monkeypatch, rollout=None)
     with pytest.raises(CliError):
         env.provider.complete(_req())
+
+
+def _timeout_env(tmp_path: Path, mp: pytest.MonkeyPatch, *, stdout: str, rollout: Any) -> Env:
+    env = Env(tmp_path, mp, stdout=stdout, rollout=rollout)
+    real = env._run
+
+    def timed(argv: Sequence[str], **kw: Any) -> CliResult:
+        if list(argv)[1] == "exec":
+            real(argv, **kw)  # plants the rollout (if any)
+            return _cli(stdout, rc=None, timed_out=True)
+        return real(argv, **kw)
+
+    mp.setattr(codex_cli, "run_cli", timed)
+    return env
+
+
+def test_timeout_with_tool_output_is_tool_use(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _timeout_env(
+        tmp_path, monkeypatch, stdout=_stdout("ok"), rollout=_tool_rollout("root:x:0:0")
+    )
+    with pytest.raises(ToolUseDetected):
+        env.provider.complete(_req())
+
+
+def test_timeout_with_model_mismatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def other(cwd: Path) -> str:
+        text = (FIX / "rollouts" / "ok_terra.jsonl").read_text().replace(MODEL, "gpt-6.1-sol")
+        return text.replace("/TMP/cwd", str(cwd))
+
+    env = _timeout_env(tmp_path, monkeypatch, stdout=_stdout("ok"), rollout=other)
+    with pytest.raises(ServedModelMismatch):
+        env.provider.complete(_req())
+
+
+def test_timeout_without_thread_started_no_delete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _timeout_env(tmp_path, monkeypatch, stdout="", rollout=None)
+    with pytest.raises(CliTimeout):
+        env.provider.complete(_req())
+    assert not any(c[1] == "delete" for c in env.calls)
+
+
+def test_tool_output_beats_usage_limit_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stdout = _err_stdout("You've hit your usage limit. Try again in 2h")
+    env = Env(tmp_path, monkeypatch, stdout=stdout, rollout=_tool_rollout("root:x:0:0"))
+    with pytest.raises(ToolUseDetected):
+        env.provider.complete(_req())
+
+
+@pytest.mark.parametrize("name", ["bad\\dir", "bad\ndir"])
+def test_work_root_backslash_newline_rejected(tmp_path: Path, name: str) -> None:
+    with pytest.raises(ValueError):
+        CodexCLIProvider(work_root=tmp_path / name)
+
+
+def test_work_root_stored_resolved(tmp_path: Path) -> None:
+    link = tmp_path / "link"
+    link.symlink_to(tmp_path)
+    p = CodexCLIProvider(work_root=link / "w")
+    assert p._work_root == (tmp_path / "w").resolve()

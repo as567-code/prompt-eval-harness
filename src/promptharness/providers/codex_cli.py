@@ -236,9 +236,10 @@ class CodexCLIProvider:
         binary: str = "codex",
         sessions_root: Path = CODEX_SESSIONS_ROOT,
     ) -> None:
-        if re.search(r'["\\\n\r]', str(work_root.resolve())):
+        resolved = work_root.resolve()
+        if re.search(r'["\\\n\r]', str(resolved)):
             raise ValueError("work_root must not contain quotes, backslashes or newlines")
-        self._work_root = work_root
+        self._work_root = resolved
         self._binary = binary
         self._sessions_root = sessions_root
         self._auth_checked = False
@@ -297,6 +298,8 @@ class CodexCLIProvider:
             if thread_id:
                 audit = self._load_audit(thread_id, started)
             if res.timed_out:
+                if audit is not None:
+                    self._audit_checks(req, audit, workdir)
                 raise CliTimeout(f"codex timed out after {req.timeout_s}s")
             return self._map(req, res, events, audit, version, workdir)
         finally:
@@ -336,6 +339,26 @@ class CodexCLIProvider:
         with contextlib.suppress(OSError):
             delete_own_rollout(audit, own_root=self._work_root)
 
+    def _audit_checks(self, req: CompletionRequest, audit: RolloutAudit, workdir: Path) -> None:
+        """Rollout evidence checks, in order: ownership, tool use, served model, effort.
+
+        Run before ANY error, exit-code or timeout mapping: stdout hides tool calls.
+        """
+        if not self._owned(audit, workdir):
+            raise CliError("rollout not owned by this call", transient=False)
+        if audit.real_tool_output:
+            raise ToolUseDetected(
+                "codex tool output: "
+                + "; ".join(c.output_excerpt for c in audit.tool_calls if not c.failed_closed)
+            )
+        if audit.model != req.model:
+            raise ServedModelMismatch(req.model, audit.model or "<none>")
+        if audit.effort != req.effort:
+            raise CliError(
+                f"codex ran with effort {audit.effort!r}, requested {req.effort!r}",
+                transient=False,
+            )
+
     def _map(
         self,
         req: CompletionRequest,
@@ -345,22 +368,8 @@ class CodexCLIProvider:
         version: str,
         workdir: Path,
     ) -> Completion:
-        # The rollout is the only evidence of tool use: audit it before any error mapping.
         if audit is not None:
-            if not self._owned(audit, workdir):
-                raise CliError("rollout not owned by this call", transient=False)
-            if audit.real_tool_output:
-                raise ToolUseDetected(
-                    "codex tool output: "
-                    + "; ".join(c.output_excerpt for c in audit.tool_calls if not c.failed_closed)
-                )
-            if audit.model != req.model:
-                raise ServedModelMismatch(req.model, audit.model or "<none>")
-            if audit.effort != req.effort:
-                raise CliError(
-                    f"codex ran with effort {audit.effort!r}, requested {req.effort!r}",
-                    transient=False,
-                )
+            self._audit_checks(req, audit, workdir)
         if not events.messages:
             for msg in events.errors:
                 if _USAGE_LIMIT_RE.search(msg):
