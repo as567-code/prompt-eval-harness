@@ -19,7 +19,7 @@ from typing import Any
 CODEX_SESSIONS_ROOT = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "sessions"
 
 _THREAD_ID_RE = re.compile(r"^[0-9a-f-]{36}$")
-_FAIL_CLOSED_MARKER = "code-mode host is disabled"
+FAIL_CLOSED_OUTPUTS: frozenset[str] = frozenset({"code-mode host is disabled"})
 _EXCERPT_MAX = 200
 _CALL_TYPES = ("custom_tool_call", "function_call")
 
@@ -70,7 +70,7 @@ def _output_text(output: Any) -> str:
                 parts.append(p["text"])
             elif isinstance(p, str):
                 parts.append(p)
-        return "\n".join(parts)
+        return "".join(parts)
     return "" if output is None else json.dumps(output)
 
 
@@ -78,8 +78,8 @@ def audit_rollout(path: Path) -> RolloutAudit:
     cwd: Path | None = None
     model: str | None = None
     effort: str | None = None
-    calls: dict[str, str] = {}  # call_id -> name, insertion ordered
-    outputs: dict[str, str] = {}
+    # Ordered items: ("call", type, call_id, name) or ("out", type, call_id, text)
+    items: list[tuple[str, str, str, str]] = []
     for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
         raw = raw.strip()
         if not raw:
@@ -104,25 +104,58 @@ def audit_rollout(path: Path) -> RolloutAudit:
                 effort = payload["effort"]
         elif kind == "response_item":
             ptype = payload.get("type")
-            call_id = str(payload.get("call_id", ""))
-            if ptype in _CALL_TYPES:
-                calls[call_id] = str(payload.get("name", ""))
-            elif ptype in tuple(f"{t}_output" for t in _CALL_TYPES):
-                outputs[call_id] = _output_text(payload.get("output"))
-    tool_calls = tuple(
-        ToolCall(
-            name=name,
-            output_excerpt=outputs.get(cid, "")[:_EXCERPT_MAX],
-            failed_closed=cid in outputs and _FAIL_CLOSED_MARKER in outputs[cid],
+            if not isinstance(ptype, str):
+                continue
+            cid = payload.get("call_id")
+            cid = cid if isinstance(cid, str) else ""
+            if ptype.endswith("_call"):
+                name = payload.get("name")
+                items.append(("call", ptype, cid, name if isinstance(name, str) else ptype))
+            elif ptype.endswith("_output"):
+                items.append(("out", ptype, cid, _output_text(payload.get("output"))))
+
+    call_id_counts: dict[str, int] = {}
+    for kind_, _t, cid, _v in items:
+        if kind_ == "call" and cid:
+            call_id_counts[cid] = call_id_counts.get(cid, 0) + 1
+    consumed: set[int] = set()
+    tool_calls: list[ToolCall] = []
+    for kind_, ptype, cid, name in items:
+        if kind_ != "call":
+            continue
+        out_idx: int | None = None
+        if cid:
+            for j, (k2, _t2, cid2, _v2) in enumerate(items):
+                if k2 == "out" and j not in consumed and cid2 == cid:
+                    out_idx = j
+                    break
+        text = ""
+        if out_idx is not None:
+            consumed.add(out_idx)
+            text = items[out_idx][3]
+        known = ptype in _CALL_TYPES
+        closed = (
+            known
+            and out_idx is not None
+            and call_id_counts.get(cid, 0) == 1
+            and text.strip() in FAIL_CLOSED_OUTPUTS
         )
-        for cid, name in calls.items()
+        tool_calls.append(
+            ToolCall(name=name, output_excerpt=text[:_EXCERPT_MAX], failed_closed=closed)
+        )
+    for j, (k2, _t2, _cid2, text) in enumerate(items):
+        if k2 == "out" and j not in consumed:
+            tool_calls.append(
+                ToolCall(name="<orphan>", output_excerpt=text[:_EXCERPT_MAX], failed_closed=False)
+            )
+    return RolloutAudit(
+        path=path, cwd=cwd, model=model, effort=effort, tool_calls=tuple(tool_calls)
     )
-    return RolloutAudit(path=path, cwd=cwd, model=model, effort=effort, tool_calls=tool_calls)
 
 
 def delete_own_rollout(audit: RolloutAudit, *, own_root: Path) -> bool:
     """Unlink the rollout only if its cwd is inside ``own_root``."""
-    if audit.cwd is None:
+    if audit.cwd is None or not audit.cwd.is_absolute():
         return False
     if not audit.cwd.resolve().is_relative_to(own_root.resolve()):
         return False

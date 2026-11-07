@@ -74,14 +74,88 @@ def test_audit_flags_real_output(tmp_path: Path) -> None:
     assert audit.model == "m2" and audit.effort == "high"
 
 
-def test_audit_list_output_parts_and_excerpt_cap(tmp_path: Path) -> None:
-    parts = [
-        {"type": "text", "text": "code-mode host is disabled"},
-        {"type": "text", "text": "z" * 500},
-    ]
-    audit = audit_rollout(_synthetic(tmp_path / "r.jsonl", "/x", parts))
-    assert audit.tool_calls[0].failed_closed is True
+MARKER = "code-mode host is disabled"
+
+
+def test_audit_excerpt_cap(tmp_path: Path) -> None:
+    audit = audit_rollout(_synthetic(tmp_path / "r.jsonl", "/x", "z" * 500))
     assert len(audit.tool_calls[0].output_excerpt) <= 200
+
+
+def test_marker_plus_real_data_not_closed(tmp_path: Path) -> None:
+    s = audit_rollout(_synthetic(tmp_path / "a.jsonl", "/x", MARKER + "\nroot:x:0:0"))
+    assert s.real_tool_output is True
+    parts = [{"type": "text", "text": MARKER}, {"type": "text", "text": "root:x:0:0"}]
+    assert audit_rollout(_synthetic(tmp_path / "b.jsonl", "/x", parts)).real_tool_output is True
+
+
+def test_pure_marker_closed_string_and_parts(tmp_path: Path) -> None:
+    assert (
+        audit_rollout(_synthetic(tmp_path / "a.jsonl", "/x", MARKER + "\n")).real_tool_output
+        is False
+    )
+    parts = [{"type": "text", "text": "code-mode host "}, {"type": "text", "text": "is disabled"}]
+    assert audit_rollout(_synthetic(tmp_path / "b.jsonl", "/x", parts)).real_tool_output is False
+
+
+def _items(path: Path, *payloads: dict[str, Any]) -> Path:
+    return _write(path, [_line("response_item", p) for p in payloads])
+
+
+def test_unknown_call_type_with_real_output(tmp_path: Path) -> None:
+    p = _items(
+        tmp_path / "r.jsonl",
+        {"type": "local_shell_call", "call_id": "c1"},
+        {"type": "local_shell_call_output", "call_id": "c1", "output": "hi"},
+    )
+    assert audit_rollout(p).real_tool_output is True
+
+
+def test_unknown_call_type_never_closed_even_with_marker(tmp_path: Path) -> None:
+    p = _items(
+        tmp_path / "r.jsonl",
+        {"type": "local_shell_call", "call_id": "c1"},
+        {"type": "local_shell_call_output", "call_id": "c1", "output": MARKER},
+    )
+    assert audit_rollout(p).real_tool_output is True
+
+
+def test_call_without_output_at_all(tmp_path: Path) -> None:
+    p = _items(tmp_path / "r.jsonl", {"type": "mcp_tool_call", "call_id": "c1", "name": "x"})
+    audit = audit_rollout(p)
+    assert len(audit.tool_calls) == 1 and audit.real_tool_output is True
+
+
+def test_duplicate_call_id_not_closed(tmp_path: Path) -> None:
+    p = _items(
+        tmp_path / "r.jsonl",
+        {"type": "function_call", "call_id": "c1", "name": "a"},
+        {"type": "function_call", "call_id": "c1", "name": "b"},
+        {"type": "function_call_output", "call_id": "c1", "output": MARKER},
+        {"type": "function_call_output", "call_id": "c1", "output": "real"},
+    )
+    audit = audit_rollout(p)
+    assert len(audit.tool_calls) == 2
+    assert all(not c.failed_closed for c in audit.tool_calls)
+    assert audit.real_tool_output is True
+
+
+def test_empty_call_id_not_closed(tmp_path: Path) -> None:
+    p = _items(
+        tmp_path / "r.jsonl",
+        {"type": "function_call", "call_id": "", "name": "a"},
+        {"type": "function_call_output", "call_id": "", "output": MARKER},
+    )
+    assert audit_rollout(p).real_tool_output is True
+
+
+def test_orphan_output_counts(tmp_path: Path) -> None:
+    p = _items(
+        tmp_path / "r.jsonl", {"type": "function_call_output", "call_id": "zz", "output": "secret"}
+    )
+    audit = audit_rollout(p)
+    assert audit.tool_calls[0].name == "<orphan>"
+    assert audit.real_tool_output is True
 
 
 def test_audit_call_without_output_not_closed(tmp_path: Path) -> None:
@@ -155,3 +229,23 @@ def test_deletes_own(tmp_path: Path) -> None:
     assert delete_own_rollout(audit, own_root=tmp_path) is True
     assert not p.exists()
     assert delete_own_rollout(audit, own_root=tmp_path) is False
+
+
+def test_refuses_relative_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    p = _write(tmp_path / "rel.jsonl", [_line("session_meta", {"cwd": "../x"})])
+    assert delete_own_rollout(audit_rollout(p), own_root=tmp_path) is False
+    assert p.exists()
+
+
+def test_refuses_symlink_escaping_own_root(tmp_path: Path) -> None:
+    own = tmp_path / "own"
+    outside = tmp_path / "outside"
+    own.mkdir()
+    outside.mkdir()
+    (own / "link").symlink_to(outside)
+    p = _write(tmp_path / "sym.jsonl", [_line("session_meta", {"cwd": str(own / "link")})])
+    assert delete_own_rollout(audit_rollout(p), own_root=own) is False
+    assert p.exists()
