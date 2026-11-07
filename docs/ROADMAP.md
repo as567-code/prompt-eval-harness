@@ -113,20 +113,38 @@ Each phase works on its own branch, `phase-N-<name>`, in a git worktree (`superp
 
 **Phase security checklist.** This is the adversarial suite at `tests/adversarial/`. Each item must end in the named class while the host stays unaffected.
 
-- [ ] Opening a socket to `1.1.1.1:53` or making an HTTP GET fails, giving `failed`.
-- [ ] A canary `PEH_CANARY_SECRET` set on the host is absent from `os.environ` inside the container.
-- [ ] Writing to `/etc/x` or `/usr/x` fails because the rootfs is read-only. Writing past the 64 MB `/work` limit fails.
-- [ ] A fork bomb is held by `--pids-limit` and the trial ends as `resource_limit` or `timeout`.
-- [ ] Allocating 2 GB ends as `resource_limit` (OOM). An infinite loop ends as `timeout` within 35 s. The host-side kill is confirmed.
-- [ ] Printing 50 MB is truncated at 256 KB and host RSS stays bounded.
-- [ ] Inside the container, `id -u` is not 0, `/proc/self/status` shows `CapEff: 0000000000000000`, and `/var/run/docker.sock` is absent.
-- [ ] `os._exit(0)` at import, a forged `report.xml`, and monkeypatching `_pytest` each end as `tamper_suspect` or `failed`, never `passed`. Candidate `print`/`os.write(1, …)` of a fake envelope never reaches the host parser, because only the runner writes to container stdout.
-- [ ] `THREAT_MODEL.md` states the residual risk: integrity against deliberately obfuscated forgery is best-effort, while host containment is the hard guarantee.
-- [ ] After the suite, `docker ps -a --filter name=peh-` is empty (no leaks).
-- [ ] `hadolint sandbox/Dockerfile` is clean. `trivy image` reports no fixable HIGH or CRITICAL. `bandit` shows no `shell=True` and no B603/B607 left unreviewed.
-- [ ] The `THREAT_MODEL.md` threat table matches PRD §9, and each row links to its test.
+- [x] Opening a socket to `1.1.1.1:53` or making an HTTP GET fails, giving `failed`. Evidence: `test_network_blocked`.
+- [x] A canary `PEH_CANARY_SECRET` set on the host is absent from `os.environ` inside the container. Evidence: `test_no_host_env`.
+- [x] Writing to `/etc/x` or `/usr/x` fails because the rootfs is read-only. Writing past the 64 MB `/work` limit fails. Evidence: `test_readonly_rootfs`, `test_work_size_cap`.
+- [x] A fork bomb is held by `--pids-limit`. The trial ends in a non-passing class (`failed`, `timeout` or `resource_limit`; R36) within the bounded kill window, and no container leaks. Evidence: `test_fork_bomb`.
+- [x] Allocating 2 GB ends as `resource_limit` (container OOM kill) or `failed` (child OOM while the runner survives; R36).
+  - An infinite loop ends as `timeout` or `failed` within 40 s: the inner `PEH_INNER_TIMEOUT` normally fires first, and the host timeout (30 s + 5 s grace) is the backstop.
+  - Evidence: `test_memory_bomb`, `test_infinite_loop`. For the host-side `docker kill` and `rm -f` of the named container, `test_host_timeout_kills_container_and_returns_timeout` (unit).
+- [x] Printing 50 MB is truncated by the runner to 16 KB stdout and 16 KB stderr tails, and host RSS stays bounded.
+  - Evidence: `test_stdout_flood`.
+  - Measured 2026-11-06 on Docker Desktop: host process max RSS was 22.0 MB for the flood vs 21.9 MB for a trivial pass, and `docker` CLI child max RSS was 29.4 MB vs 29.6 MB.
+  - Observed: the flood itself ends as `failed` (collection error, ENOSPC), because pytest's capture file fills the 16 MB `/tmp` tmpfs.
+- [x] Inside the container, `id -u` is not 0, `/proc/self/status` shows `CapEff: 0000000000000000`, and `/var/run/docker.sock` is absent. Evidence: `test_unprivileged`.
+- [x] `os._exit(0)` at import, a forged `report.xml`, and monkeypatching `_pytest` each end as `tamper_suspect` or `failed`, never `passed`.
+  - Candidate `print`/`os.write(1, …)` of a fake envelope never reaches the host parser, because only the runner writes to container stdout.
+  - Evidence: `test_os_exit_forgery`, `test_fake_report_forgery`, `test_forged_report_with_os_exit_is_tamper`, `test_forged_report_with_execv_is_tamper`, `test_pytest_monkeypatch_is_tamper`, `test_fake_envelope_on_stdout`, `test_fake_envelope_literal_is_flagged`.
+  - The `_pytest` case is caught only by the static scan. With the scan off, the same wrong candidate grades `passed` (measured), so THREAT_MODEL lists it as a residual.
+- [x] `THREAT_MODEL.md` states the residual risk: integrity against deliberately obfuscated forgery is best-effort, while host containment is the hard guarantee. Evidence: THREAT_MODEL "Residual risks".
+- [x] After the suite, `docker ps -a --filter name=peh-` is empty (no leaks). Evidence: the per-module autouse leak check in `tests/adversarial/conftest.py`.
+- [x] `hadolint sandbox/Dockerfile` is clean. `trivy image` reports no fixable HIGH or CRITICAL. `bandit` shows no `shell=True` and no B603/B607 left unreviewed.
+  - Evidence: the CI `sandbox` job (hadolint, Trivy) and the `checks` job (bandit `-ll`).
+  - Bandit's low-severity pass (`-l`) reports 5 B603 and 2 B607 sites: `subprocess_runner.py:109`, `docker_runner.py:226,241`, and `image.py:17,24`.
+  - Each one is an argv list with a fixed executable and carries a reviewed `# noqa: S603`/`S607`, because ruff's `S` rules are enabled and force the annotation.
+- [x] The `THREAT_MODEL.md` threat table matches PRD §9 for the sandbox's adversary (A: network, secrets, host filesystem, disk, resources, privilege, forgery), and each row links to its test.
+  - The other PRD §9 rows (judge injection, YAML/XML, path traversal, secret leakage, quota, supply chain, CI, dashboard XSS, owner CLI state) are verified in PRD §9's own "Verified by" column.
+  - They are deepened in their owning phases (judge P4, router P6, dashboards P8).
 
 **Exit:** the adversarial suite passes on Docker Desktop. Median sandbox overhead is measured and recorded, with a target under 2.5 s per trial.
+
+- **Measured 2026-11-06 (Docker Desktop 29.7.2, macOS).**
+  - Adversarial suite: 17 tests, all pass. CI Linux: the full non-live suite passes, with coverage ≥ 85%.
+  - Sandbox wall time for `test_passing_solution`'s input, 20 timed runs after one warm-up: **median 0.27 s**, min 0.25 s, max 0.30 s.
+  - The independent G5 re-measurement gave a median of 0.29 s.
 
 ## P3: Dataset
 
