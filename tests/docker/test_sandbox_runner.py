@@ -51,6 +51,19 @@ def test_syntax_error_solution_is_failed_not_tamper(runner: SandboxRunner) -> No
     assert res.status is SandboxStatus.FAILED, res
 
 
+def test_syntax_error_candidate_is_failed_with_info(runner: SandboxRunner) -> None:
+    from promptharness.sandbox.tamper import scan
+
+    bad = "def add(:\n"
+    assert "syntax_error" in scan(bad).info
+    res = runner.run(
+        {"solution.py": bad, "test_hidden.py": TESTS},
+        test_files=["test_hidden.py"],
+        candidate=bad,
+    )
+    assert res.status is SandboxStatus.FAILED, res
+
+
 def test_missing_test_is_tamper(runner: SandboxRunner) -> None:
     # Candidate-supplied conftest silently deselects one hidden test and reports success.
     conftest = (

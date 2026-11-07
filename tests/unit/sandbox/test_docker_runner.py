@@ -416,3 +416,11 @@ def test_forgery_does_not_outrank_timeout_or_sandbox_error(tmp_path: Path) -> No
         tmp_path, "import ctypes", code=125, stderr="Cannot connect to the Docker daemon"
     )
     assert res2.status is SandboxStatus.SANDBOX_ERROR
+
+
+def test_syntax_error_candidate_is_failed_with_info(tmp_path: Path) -> None:
+    from promptharness.sandbox.tamper import scan
+
+    assert "syntax_error" in scan("def add(:\n").info
+    res = _run_candidate(tmp_path, "def add(:\n", stdout=line(envelope(junit=None, exit_code=1)))
+    assert res.status is SandboxStatus.FAILED

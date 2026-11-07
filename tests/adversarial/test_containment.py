@@ -77,8 +77,9 @@ def test_fork_bomb(runner: SandboxRunner, leaked_containers: Callable[[], str | 
     res = _run(runner, solution)
     elapsed = time.monotonic() - start
     assert res.status is not SandboxStatus.PASSED, res
-    # Host timeout (30 + 5 grace) plus the kill/rm caps, which stretch while the daemon is starved.
-    assert elapsed < 30 + 5 + 15 + 5
+    # Host timeout (30 + 5 grace) plus the kill and rm caps (15 s each); the daemon is starved
+    # by the fork bomb, so both can run long.
+    assert elapsed < 30 + 5 + 15 + 15 + 5
     assert not leaked_containers()
 
 
