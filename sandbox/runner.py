@@ -57,6 +57,10 @@ def _validate_name(name: str) -> None:
         raise ValueError(f"bad member name (leading dash): {name!r}")
     if "report.xml" in parts:
         raise ValueError("bad member name: report.xml is reserved")
+    if any("." in p for p in parts[:-1]) or (
+        parts[-1].endswith(".py") and "." in parts[-1][: -len(".py")]
+    ):
+        raise ValueError(f"bad member name (dot in module path): {name!r}")
 
 
 def safe_extract(tar_bytes: bytes, dest: Path) -> list[str]:
