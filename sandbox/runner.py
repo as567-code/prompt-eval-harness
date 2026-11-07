@@ -28,6 +28,7 @@ REPORT_MAX_BYTES = 2_000_000
 MAX_NAME_LEN = 255
 MAX_COMPONENT_LEN = 100
 DEFAULT_TIMEOUT = 25
+POST_EXIT_GRACE_S = 0.5
 PR_SET_DUMPABLE = 4
 NAME_RE = re.compile(r"^[A-Za-z0-9_./-]+$")
 TEST_RE = re.compile(r"^test_.*\.py$")
@@ -54,7 +55,7 @@ def _validate_name(name: str) -> None:
         raise ValueError(f"bad member path: {name!r}")
     if any(p.startswith("-") for p in parts):
         raise ValueError(f"bad member name (leading dash): {name!r}")
-    if name == "report.xml":
+    if "report.xml" in parts:
         raise ValueError("bad member name: report.xml is reserved")
 
 
@@ -179,12 +180,18 @@ def _run_child(argv: list[str], timeout: int) -> tuple[int, bytes, bytes, bool]:
         bufs[stream.fileno()] = bytearray()
         sel.register(stream, selectors.EVENT_READ)
     timed_out = False
+    exited_at: float | None = None
     while sel.get_map():
-        remaining = deadline - time.monotonic()
+        now = time.monotonic()
+        remaining = deadline - now
         if remaining <= 0:
             timed_out = True
             break
-        for key, _ in sel.select(min(remaining, 1.0)):
+        if exited_at is None and child.poll() is not None:
+            exited_at = now
+        if exited_at is not None and now - exited_at >= POST_EXIT_GRACE_S:
+            break
+        for key, _ in sel.select(min(remaining, 0.1)):
             chunk = os.read(key.fd, 65536)
             if not chunk:
                 sel.unregister(key.fileobj)
@@ -222,7 +229,12 @@ def _read_report() -> tuple[str | None, str | None]:
             return None, "report_not_regular"
         if st.st_size > REPORT_MAX_BYTES:
             return None, "report_too_large"
-        data = os.read(fd, REPORT_MAX_BYTES + 1)
+        data = b""
+        while len(data) <= REPORT_MAX_BYTES:
+            chunk = os.read(fd, REPORT_MAX_BYTES + 1 - len(data))
+            if not chunk:
+                break
+            data += chunk
         if len(data) > REPORT_MAX_BYTES:
             return None, "report_too_large"
         return data.decode("utf-8", "replace"), None
@@ -236,6 +248,14 @@ def main() -> int:
     if not _set_nondumpable():
         _emit(-1, error="nodumpable")
         return 3
+    try:
+        return _run()
+    except Exception as exc:
+        _emit(-1, error=f"runner_internal: {type(exc).__name__}: {exc}"[:500])
+        return 0
+
+
+def _run() -> int:
     data = sys.stdin.buffer.read(MAX_TOTAL_BYTES + 1)
     if len(data) > MAX_TOTAL_BYTES:
         _emit(-1, error="bad_tar: input too large")
@@ -246,7 +266,11 @@ def main() -> int:
         _emit(-1, error=f"bad_tar: {exc}")
         return 0
     tests = [n for n in names if TEST_RE.fullmatch(n.rsplit("/", 1)[-1])]
-    REPORT.unlink(missing_ok=True)
+    try:
+        REPORT.unlink(missing_ok=True)
+    except OSError:
+        _emit(-1, error="bad_tar: report path unusable")
+        return 0
     argv = [
         sys.executable,
         "-m",
