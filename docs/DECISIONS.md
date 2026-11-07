@@ -73,6 +73,15 @@ These are the binding rulings made while building Plan A1 (P0–P2). Each was ma
   - `unscannable` (RecursionError) stays forgery, documented in THREAT_MODEL as a deliberate choice: such code does execute.
   - P3 dataset seeds must avoid task topics about JUnit, pytest internals, or process killing, so honest gold solutions can't trip the scan. This is enforced because gold solutions must be PASSED at QC (R37).
   - — Rationale: this closes the cheap `exec` gap and removes the likeliest false positives — if wrong, a rare honest solution using exec is labeled tamper (visible in the detail).
+- **R40.** 
+  - **What forgery needs.** A forged report passes only if pytest terminates with exit 0 before writing its own report, or if pytest writes a report the candidate tampered with. A non-zero exit with an all-pass report is already TAMPER_SUSPECT (Task 14). So the forgery list must cover these:
+  - (a) process replacement: `execv`, `execve`, `execl`, `execle`, `execlp`, `execlpe`, `execvp`, and `execvpe` as attributes on any base;
+  - (b) frame and object walking that reaches pytest internals: `sys._getframe`, `inspect.currentframe`, `inspect.stack`, `inspect.trace`, `gc.get_objects`, `gc.get_referrers`, and `gc.get_referents`. These move from info to forgery; other `inspect` uses stay info.
+  - **Kill narrowing.** Keeping `kill`/`killpg` narrowed to os (R39) stays correct, because any kill gives a non-zero exit.
+  - **Parse the bytes the container runs.** Scan `ast.parse(source_bytes, feature_version=(3, 12))`, where `source_bytes` is exactly what the tar builder writes. That honours BOM and coding cookies the same way the container's CPython 3.12 does.
+  - **Scan what is actually sent.** `SandboxRunner.run` scans `files["solution.py"]` itself. The separate `candidate=` parameter is removed, or reduced to a bool flag (`scan_candidate=True`), so the scanned bytes can't differ from the executed bytes.
+  - Syntax-error handling under R38 still applies, now on the exact bytes.
+  - — This closes the parser-differential bypass and the clean-exit forgery paths — if wrong, a rare honest solution using frame introspection is labeled tamper.
 
 ## Carry-forward to Plan A2 / Plan B (P3–P7)
 
