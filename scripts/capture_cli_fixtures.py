@@ -60,6 +60,14 @@ DROP_KEY_RE = re.compile(r"(?i)(credential|user_id|account_id|email)")
 ID_KEYS = {"session_id", "uuid", "thread_id"}
 UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+TZ_RE = re.compile(
+    r"\b(?:America|Europe|Asia|Africa|Australia|Pacific|Atlantic|Indian|Antarctica|Etc)"
+    r"/[A-Za-z_+-]+(?:/[A-Za-z_]+)?"
+)
+TMP_SLASH_RE = re.compile(r"/(?:private/)?var/folders/[^/\s\"']+/[^/\s\"']+/T(?=/|$|[\s\"'])")
+TMP_DASH_RE = re.compile(r"-(?:private-)?var-folders-[A-Za-z0-9]+-[A-Za-z0-9-]+?-T-")
+PLACEHOLDER_RE = re.compile(r"^01[ab]{6}-0000-7000-8000-\d{12}$")
+REDACTED = "REDACTED_CONTEXT"
 
 
 def placeholder(n: int, prefix: str = "01aaaaaa") -> str:
@@ -83,11 +91,16 @@ class Sanitizer:
         s = s.replace(self.user, "USER")
         for real, ph in self.thread_ids.items():
             s = s.replace(real, ph)
+        s = TMP_SLASH_RE.sub("/TMP", s)
+        s = TMP_DASH_RE.sub("-TMP-", s)
+        s = TZ_RE.sub("UTC", s)
         return EMAIL_RE.sub("EMAIL", s)
 
     def _id(self, value: str) -> str:
         if value in self.thread_ids:
             return self.thread_ids[value]
+        if PLACEHOLDER_RE.match(value):  # already sanitized (idempotent --resanitize)
+            return value
         if value not in self._anon:
             self._anon[value] = placeholder(len(self._anon) + 1, "01bbbbbb")
         return self._anon[value]
@@ -98,7 +111,9 @@ class Sanitizer:
             for k, v in o.items():
                 if DROP_KEY_RE.search(k):
                     continue
-                if k in ID_KEYS and isinstance(v, str):
+                if k.lower() in {"timezone", "time_zone", "tz"} and isinstance(v, str):
+                    out[k] = "UTC"
+                elif k in ID_KEYS and isinstance(v, str):
                     out[k] = self._id(v)
                 else:
                     out[k] = self.obj(v)
@@ -106,17 +121,53 @@ class Sanitizer:
         if isinstance(o, list):
             return [self.obj(v) for v in o]
         if isinstance(o, str):
+            stripped = o.lstrip()
+            if stripped[:1] in ("{", "["):
+                try:
+                    inner = json.loads(o)
+                except json.JSONDecodeError:
+                    inner = None
+                if isinstance(inner, dict | list):
+                    return json.dumps(self.obj(inner), ensure_ascii=False, separators=(",", ":"))
             return self.text(o)
         return o
+
+    @staticmethod
+    def _redact_all(o: Any) -> Any:
+        if isinstance(o, dict):
+            return {k: Sanitizer._redact_all(v) for k, v in o.items()}
+        if isinstance(o, list):
+            return [Sanitizer._redact_all(v) for v in o]
+        return REDACTED if isinstance(o, str) else o
+
+    def rollout_line(self, line: Any) -> Any:
+        """Redact message text and skills/environment context; keep audit-relevant items."""
+        payload = line.get("payload") if isinstance(line, dict) else None
+        if not isinstance(payload, dict):
+            return line
+        if line.get("type") == "response_item" and payload.get("type") == "message":
+            for part in payload.get("content", []):
+                if isinstance(part, dict) and "text" in part:
+                    part["text"] = REDACTED
+        elif line.get("type") == "world_state":
+            state = payload.get("state")
+            if isinstance(state, dict):
+                for key in ("host_skills", "agents_md"):
+                    if key in state:
+                        state[key] = self._redact_all(state[key])
+        return line
 
     def json_text(self, raw: str) -> str:
         return json.dumps(self.obj(json.loads(raw)), indent=2, ensure_ascii=False) + "\n"
 
-    def jsonl_text(self, raw: str) -> str:
+    def jsonl_text(self, raw: str, rollout: bool = False) -> str:
         lines = []
         for line in raw.splitlines():
             if line.strip():
-                lines.append(json.dumps(self.obj(json.loads(line)), ensure_ascii=False))
+                o = self.obj(json.loads(line))
+                if rollout:
+                    o = self.rollout_line(o)
+                lines.append(json.dumps(o, ensure_ascii=False))
         return "\n".join(lines) + "\n"
 
 
@@ -172,7 +223,25 @@ def find_rollout(thread_id: str, cwd: Path) -> Path | None:
     return None
 
 
+def resanitize() -> int:
+    """Re-apply the sanitizer to the committed fixtures in place. Makes no CLI calls."""
+    s = Sanitizer({}, {})
+    for path in sorted(p for p in FIX.rglob("*") if p.is_file()):
+        raw = path.read_text(encoding="utf-8")
+        if path.suffix == ".json":
+            out = s.json_text(raw)
+        elif path.suffix == ".jsonl":
+            out = s.jsonl_text(raw, rollout=path.parent.name == "rollouts")
+        else:
+            out = s.text(raw)
+        path.write_text(out, encoding="utf-8")
+        print(f"resanitized {path.relative_to(FIX)}")
+    return 0
+
+
 def main() -> int:
+    if "--resanitize" in sys.argv[1:]:
+        return resanitize()
     if os.environ.get("PEH_LIVE") != "1":
         print("refusing to run: set PEH_LIVE=1", file=sys.stderr)
         return 1
@@ -253,7 +322,10 @@ def main() -> int:
         if rollout is None:
             notes.append(f"codex/{name}: ROLLOUT NOT FOUND for own thread")
             continue
-        save(FIX / "codex" / "rollouts" / f"{name}.jsonl", s.jsonl_text(rollout.read_text("utf-8")))
+        save(
+            FIX / "codex" / "rollouts" / f"{name}.jsonl",
+            s.jsonl_text(rollout.read_text("utf-8"), rollout=True),
+        )
         dres = run_cli(["codex", "delete", tid], cwd=tmp, timeout_s=30)
         notes.append(
             f"codex delete {name}: rc={dres.returncode} timed_out={dres.timed_out} "

@@ -63,3 +63,27 @@ def test_fixtures_present(path: Path) -> None:
     assert "user_id" not in low
     assert getpass.getuser() not in text
     assert not EMAIL_LIKE.search(text)
+
+
+TZ_LIKE = re.compile(r"\b(?:America|Europe|Asia|Africa|Australia|Pacific|Atlantic)/[A-Z][A-Za-z_]+")
+
+
+@pytest.mark.parametrize("path", ALL_FILES, ids=lambda p: str(p.relative_to(FIX)))
+def test_fixtures_have_no_tz_or_temp_hash(path: Path) -> None:
+    text = path.read_text(encoding="utf-8")
+    assert not TZ_LIKE.search(text)
+    assert "/var/folders/" not in text
+    assert "-var-folders-" not in text
+
+
+@pytest.mark.parametrize("name", CODEX_JSONL)
+def test_rollout_message_items_are_redacted(name: str) -> None:
+    for line in _jsonl(FIX / "codex" / "rollouts" / f"{name}.jsonl"):
+        assert isinstance(line, dict)
+        payload = line.get("payload")
+        if line["type"] == "response_item" and payload["type"] == "message":
+            assert payload["role"]
+            for part in payload["content"]:
+                assert part["text"] == "REDACTED_CONTEXT"
+        if line["type"] == "world_state":
+            assert "host_skills" not in json.dumps(line) or "REDACTED_CONTEXT" in json.dumps(line)
