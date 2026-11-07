@@ -104,6 +104,27 @@ def test_fake_envelope_literal_is_flagged(runner: SandboxRunner) -> None:
     assert res.status is SandboxStatus.TAMPER_SUSPECT, res
 
 
+def test_pytest_monkeypatch_is_tamper(runner: SandboxRunner) -> None:
+    """In-process patching of pytest's report outcome flips a wrong answer to all-pass.
+
+    The candidate runs inside the pytest process, so the runtime cannot stop it. Only the static
+    scan (``import:_pytest``) catches it: with the scan off, this exact candidate grades PASSED.
+    """
+    solution = (
+        "import _pytest.reports\n"
+        "_orig = _pytest.reports.TestReport.__init__\n"
+        "def _patched(self, *a, **k):\n"
+        "    _orig(self, *a, **k)\n"
+        "    self.outcome = 'passed'\n"
+        "_pytest.reports.TestReport.__init__ = _patched\n"
+        "def f():\n"
+        "    return 2\n"
+    )
+    res = _run(runner, solution)
+    assert res.status is SandboxStatus.TAMPER_SUSPECT, res
+    assert "_pytest" in res.detail
+
+
 def test_obfuscated_exit_residual(runner: SandboxRunner) -> None:
     """Documents that the static scan is bypassable; the missing report still fails the run."""
     solution = 'getattr(__import__("o" + "s"), "_e" + "xit")(0)\n'
