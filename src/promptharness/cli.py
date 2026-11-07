@@ -4,10 +4,12 @@ import typer
 
 from promptharness import __version__
 from promptharness.models_cli import models_app
+from promptharness.sandbox_cli import sandbox_app
 from promptharness.security import install_redaction
 
 app = typer.Typer(help="Prompt-evaluation harness and model router.", no_args_is_help=True)
 app.add_typer(models_app, name="models")
+app.add_typer(sandbox_app, name="sandbox")
 
 
 def _version_callback(value: bool) -> None:

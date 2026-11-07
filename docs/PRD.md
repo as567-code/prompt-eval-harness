@@ -186,7 +186,7 @@ docker run --rm -i --network none --read-only
   --user 10001:10001 --cap-drop ALL --security-opt no-new-privileges
   --pids-limit 128 --memory 512m --memory-swap 512m --cpus 1
   --ulimit nofile=256:256 --ulimit fsize=33554432
-  --env PYTHONDONTWRITEBYTECODE=1 --name peh-<uuid>
+  --env PYTHONDONTWRITEBYTECODE=1 --env PEH_INNER_TIMEOUT=<timeout-5> --name peh-<uuid>
   promptharness-sandbox@sha256:<digest>
 ```
 
@@ -196,12 +196,22 @@ docker run --rm -i --network none --read-only
   2. It safely unpacks the tar to `/work`: regular files only, no absolute paths, no `..`, no links.
   3. It runs `python -m pytest -q -p no:cacheprovider --junitxml=/work/report.xml` as a **child process**, with stdout and stderr piped back to the runner.
   4. When the child exits, the runner alone writes one JSON envelope to the container's stdout: exit code, report, and output tails. The candidate code can't write to the container's stdout at all.
-- **Host side.** A hard wall-clock timeout (default 30 s, plus 5 s grace) triggers `docker kill`. stdout and stderr are each capped at 256 KB. The JUnit XML is parsed with `defusedxml`. Every call uses an argv list. `shell=True` is never used.
-- **Integrity.** The candidate code runs in-process with pytest. It could in principle forge results, by writing a fake report or exiting early.
-  - **Manifest check.** A trial passes only if the parsed report covers **exactly the expected tests**, all passed. The expected tests are found by AST-parsing the host's copy of the test file. Parametrized cases are matched by base test name. Missing or extra tests give `tamper_suspect`.
-  - **Static forgery scan** (AST, on the host). Patterns that are only needed to forge a result give `tamper_suspect`: `os._exit`, `os.kill`, imports of `pytest`, `_pytest`, `ctypes`, or `faulthandler`, assignment into `sys.modules`, and any string literal naming `junit` or `report.xml`. Other suspicious patterns are only *recorded* in `tamper_flags` for review: `inspect`, `sys.exit`, `gc.get_objects`, and reads of `test_*.py`. Legitimate code can use those.
-  - **Residual risk,** stated in `THREAT_MODEL.md`. Grading integrity against *deliberately obfuscated* adversarial code is best-effort. Host containment is not best-effort. It is the hard guarantee.
-- **Result classes.** `passed`, `failed`, `timeout`, `resource_limit` (OOM or pids), `tamper_suspect`, and `sandbox_error`. Only `sandbox_error` is an infra error (§5.8).
+- **Host side.** A hard wall-clock timeout (default 30 s, plus 5 s grace) triggers `docker kill`. output size is bounded by the trusted runner: 16 KB stdout and stderr tails, plus a junit report of at most 2 MB, all inside the single envelope line. The host does not truncate it further. The JUnit XML is parsed with `defusedxml`. Every call uses an argv list. `shell=True` is never used.
+- **Integrity.** The candidate code runs in-process with pytest. It could in principle forge a result, for example by writing a fake report and exiting early. Three layers apply:
+  - **Trusted runner.** The runner makes itself non-dumpable and runs pytest as a child, in its own session. Only the runner writes to the container's stdout, as exactly one JSON envelope. Every candidate-reachable failure still produces an envelope (R35), so candidate input can never turn into an excluded `sandbox_error`.
+  - **Manifest check.** A trial passes only if the parsed report covers exactly the expected tests, all passed, with pytest exit 0. The expected tests come from an AST parse of the host's copy of the test file. Missing or extra tests mean `tamper_suspect`. A missing, malformed, oversized, or non-regular report means `failed`.
+  - **Static forgery scan.** This is an AST scan of the candidate on the host (R38, R39). These patterns, which are needed only to forge, mean `tamper_suspect`:
+    - `_exit` on any base, or `os.kill` / `os.killpg` (with aliases resolved)
+    - `exec`, `eval`, or `compile`
+    - imports of `pytest`, `_pytest`, `ctypes`, or `faulthandler`
+    - writes into `sys.modules`
+    - a `report.xml` string, or a `junit` string outside docstrings
+
+    Patterns that legitimate code can use are only recorded: `inspect`, `sys.exit`, `gc.get_objects`, and reads of `test_*.py`. A syntax error is recorded as info, not forgery, because the code can't run.
+  - **Residual risk.** This is stated in `docs/THREAT_MODEL.md`. Grading integrity against deliberately obfuscated forgery is best-effort; host containment is the hard guarantee. Examples of what gets through: `getattr` with built strings, `__builtins__["exec"]`, and computed paths.
+- **Result classes.** `passed`, `failed`, `timeout`, `resource_limit`, `tamper_suspect`, and `sandbox_error`.
+  - `resource_limit` means a container-level kill: exit 137 with no envelope. A child OOM that the runner survives is graded `failed` (R36).
+  - Only `sandbox_error` is an infra error (§5.8). It covers a Docker daemon or image failure, or a broken image (`nodumpable`), and never comes from candidate input.
 - **Image.** `python:3.12-slim` pinned by digest, with `pytest` pinned. It is built once by `promptharness sandbox build`.
 - **Concurrency.** A semaphore, default 4. Containers are removed after every trial, and a test asserts none leak.
 
