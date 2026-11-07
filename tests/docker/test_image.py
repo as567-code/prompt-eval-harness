@@ -4,6 +4,7 @@ import io
 import json
 import subprocess
 import tarfile
+import time
 from pathlib import Path
 
 import pytest
@@ -115,3 +116,23 @@ def test_inner_timeout_kills_group() -> None:
     env = _run({"test_hang.py": hang}, "-e", "PEH_INNER_TIMEOUT=2")
     assert env["error"] == "inner_timeout"
     assert env["exit_code"] == -1
+
+
+def test_report_xml_directory_member_emits_envelope() -> None:
+    env = _run({"report.xml/test_a.py": _PASSING_TEST})
+    assert str(env["error"]).startswith("bad_tar:")
+
+
+def test_leftover_daemon_does_not_block_or_mask_result() -> None:
+    daemon = (
+        "import subprocess, sys\n"
+        "def test_spawns_daemon():\n"
+        "    subprocess.Popen(['sleep', '60'], start_new_session=True,\n"
+        "                     stdout=sys.__stdout__, stderr=sys.__stderr__)\n"
+    )
+    start = time.monotonic()
+    env = _run({"test_d.py": daemon}, "-e", "PEH_INNER_TIMEOUT=25")
+    assert time.monotonic() - start < 5
+    assert env["error"] is None
+    assert env["exit_code"] == 0
+    assert env["junit_xml"]

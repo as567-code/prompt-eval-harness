@@ -129,3 +129,27 @@ def test_timeout_env_robust(monkeypatch: pytest.MonkeyPatch) -> None:
         assert runner._timeout_from_env() == 25
     monkeypatch.setenv("PEH_INNER_TIMEOUT", "7")
     assert runner._timeout_from_env() == 7
+
+
+def test_extract_rejects_report_xml_component(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match=r"report\.xml"):
+        runner.safe_extract(_tar([("report.xml/test_a.py", b"x")]), tmp_path / "w")
+    with pytest.raises(ValueError, match=r"report\.xml"):
+        runner.safe_extract(_tar([("d/report.xml/test_a.py", b"x")]), tmp_path / "w")
+
+
+def test_main_internal_error_emits_single_envelope(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def boom(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("kaput")
+
+    monkeypatch.setattr(runner, "_set_nondumpable", lambda: True)
+    monkeypatch.setattr(runner, "safe_extract", boom)
+    monkeypatch.setattr(runner.sys, "stdin", io.TextIOWrapper(io.BytesIO(b"x")))
+    assert runner.main() == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 1
+    env = __import__("json").loads(lines[0])
+    assert env["error"].startswith("runner_internal: RuntimeError: kaput")
+    assert env["junit_xml"] is None
