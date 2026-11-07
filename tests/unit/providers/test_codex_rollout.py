@@ -249,3 +249,41 @@ def test_refuses_symlink_escaping_own_root(tmp_path: Path) -> None:
     p = _write(tmp_path / "sym.jsonl", [_line("session_meta", {"cwd": str(own / "link")})])
     assert delete_own_rollout(audit_rollout(p), own_root=own) is False
     assert p.exists()
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"type": "image", "image_url": "data:image/png;base64,AAAA"},
+        {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+        {"no_text": 1},
+        42,
+    ],
+)
+def test_marker_plus_non_text_part_not_closed(tmp_path: Path, extra: Any) -> None:
+    out = [{"type": "text", "text": MARKER}, extra]
+    assert audit_rollout(_synthetic(tmp_path / "r.jsonl", "/x", out)).real_tool_output is True
+
+
+def test_marker_split_over_text_parts_clean(tmp_path: Path) -> None:
+    out = [
+        {"type": "output_text", "text": "code-mode "},
+        {"type": "text", "text": "host is disabled"},
+    ]
+    assert audit_rollout(_synthetic(tmp_path / "r.jsonl", "/x", out)).real_tool_output is False
+
+
+def test_uppercase_call_type_detected(tmp_path: Path) -> None:
+    p = _items(
+        tmp_path / "r.jsonl",
+        {"type": "LOCAL_SHELL_CALL", "call_id": "c1"},
+        {"type": "Local_Shell_Call_Output", "call_id": "c1", "output": "hi"},
+    )
+    audit = audit_rollout(p)
+    assert len(audit.tool_calls) == 1 and audit.real_tool_output is True
+
+
+def test_non_string_type_is_anomalous(tmp_path: Path) -> None:
+    audit = audit_rollout(_items(tmp_path / "r.jsonl", {"type": 7}))
+    assert audit.tool_calls[0].name == "<anomalous>"
+    assert audit.real_tool_output is True

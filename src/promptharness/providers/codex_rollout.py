@@ -21,6 +21,7 @@ CODEX_SESSIONS_ROOT = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
 _THREAD_ID_RE = re.compile(r"^[0-9a-f-]{36}$")
 FAIL_CLOSED_OUTPUTS: frozenset[str] = frozenset({"code-mode host is disabled"})
 _EXCERPT_MAX = 200
+_TEXT_PART_TYPES = ("text", "output_text", "input_text")
 _CALL_TYPES = ("custom_tool_call", "function_call")
 
 
@@ -66,10 +67,15 @@ def _output_text(output: Any) -> str:
     if isinstance(output, list):
         parts = []
         for p in output:
-            if isinstance(p, dict) and isinstance(p.get("text"), str):
-                parts.append(p["text"])
-            elif isinstance(p, str):
+            if isinstance(p, str):
                 parts.append(p)
+            elif isinstance(p, dict):
+                if isinstance(p.get("text"), str) and p.get("type") in _TEXT_PART_TYPES:
+                    parts.append(p["text"])
+                else:
+                    parts.append(json.dumps(p, sort_keys=True, default=repr))
+            else:
+                parts.append(repr(p))
         return "".join(parts)
     return "" if output is None else json.dumps(output)
 
@@ -103,9 +109,11 @@ def audit_rollout(path: Path) -> RolloutAudit:
             if isinstance(payload.get("effort"), str):
                 effort = payload["effort"]
         elif kind == "response_item":
-            ptype = payload.get("type")
-            if not isinstance(ptype, str):
+            raw_type = payload.get("type")
+            if not isinstance(raw_type, str):
+                items.append(("call", "<anomalous>", "", "<anomalous>"))
                 continue
+            ptype = raw_type.lower()
             cid = payload.get("call_id")
             cid = cid if isinstance(cid, str) else ""
             if ptype.endswith("_call"):
