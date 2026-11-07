@@ -11,14 +11,23 @@ import io
 import json
 import os
 import re
+import selectors
+import signal
+import stat
 import subprocess
 import sys
 import tarfile
+import time
+from contextlib import suppress
 from pathlib import Path
 
 MAX_TOTAL_BYTES = 8 * 1024 * 1024
 MAX_MEMBERS = 64
 TAIL_BYTES = 16 * 1024
+REPORT_MAX_BYTES = 2_000_000
+MAX_NAME_LEN = 255
+MAX_COMPONENT_LEN = 100
+DEFAULT_TIMEOUT = 25
 PR_SET_DUMPABLE = 4
 NAME_RE = re.compile(r"^[A-Za-z0-9_./-]+$")
 TEST_RE = re.compile(r"^test_.*\.py$")
@@ -36,7 +45,11 @@ def _validate_name(name: str) -> None:
         raise ValueError(f"bad member name: {name!r}")
     if name.startswith("/"):
         raise ValueError(f"bad member path (absolute): {name!r}")
+    if len(name) > MAX_NAME_LEN:
+        raise ValueError("bad member name: too long")
     parts = name.split("/")
+    if any(len(p) > MAX_COMPONENT_LEN for p in parts):
+        raise ValueError("bad member name: component too long")
     if any(p in ("", ".", "..") for p in parts):
         raise ValueError(f"bad member path: {name!r}")
     if any(p.startswith("-") for p in parts):
@@ -90,10 +103,14 @@ def safe_extract(tar_bytes: bytes, dest: Path) -> list[str]:
 
 
 def _tail(data: bytes | str | None) -> str:
+    """Return at most TAIL_BYTES bytes (UTF-8) of the end of ``data``, on a char boundary."""
     if data is None:
         return ""
     raw = data.encode("utf-8", "replace") if isinstance(data, str) else data
-    return raw[-TAIL_BYTES:].decode("utf-8", "replace")
+    text = raw[-TAIL_BYTES:].decode("utf-8", "replace")
+    while (excess := len(text.encode("utf-8")) - TAIL_BYTES) > 0:
+        text = text[(excess + 2) // 3 :]
+    return text
 
 
 def _emit(
@@ -128,6 +145,93 @@ def _set_nondumpable() -> bool:
         return False
 
 
+def _timeout_from_env() -> int:
+    try:
+        value = int(os.environ.get("PEH_INNER_TIMEOUT", str(DEFAULT_TIMEOUT)))
+    except ValueError:
+        return DEFAULT_TIMEOUT
+    return value if value > 0 else DEFAULT_TIMEOUT
+
+
+def _kill_group(child: subprocess.Popen[bytes]) -> None:
+    with suppress(ProcessLookupError, PermissionError):
+        os.killpg(child.pid, signal.SIGKILL)
+
+
+def _run_child(argv: list[str], timeout: int) -> tuple[int, bytes, bytes, bool]:
+    """Run ``argv``; keep only the tail of each stream. Returns (rc, out, err, timed_out)."""
+    child = subprocess.Popen(  # noqa: S603
+        argv,
+        cwd=WORK,
+        env=CHILD_ENV,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        close_fds=True,
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + timeout
+    bufs: dict[int, bytearray] = {}
+    sel = selectors.DefaultSelector()
+    if child.stdout is None or child.stderr is None:
+        raise RuntimeError("pipes not created")
+    for stream in (child.stdout, child.stderr):
+        bufs[stream.fileno()] = bytearray()
+        sel.register(stream, selectors.EVENT_READ)
+    timed_out = False
+    while sel.get_map():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            timed_out = True
+            break
+        for key, _ in sel.select(min(remaining, 1.0)):
+            chunk = os.read(key.fd, 65536)
+            if not chunk:
+                sel.unregister(key.fileobj)
+                continue
+            buf = bufs[key.fd]
+            buf += chunk
+            if len(buf) > 2 * TAIL_BYTES:
+                del buf[:-TAIL_BYTES]
+    sel.close()
+    if not timed_out:
+        try:
+            child.wait(timeout=max(deadline - time.monotonic(), 0.01))
+        except subprocess.TimeoutExpired:
+            timed_out = True
+    _kill_group(child)
+    child.wait()
+    out = bytes(bufs[child.stdout.fileno()])
+    err = bytes(bufs[child.stderr.fileno()])
+    child.stdout.close()
+    child.stderr.close()
+    return child.returncode, out, err, timed_out
+
+
+def _read_report() -> tuple[str | None, str | None]:
+    """Read report.xml safely. Returns (junit_xml, error)."""
+    try:
+        fd = os.open(REPORT, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None, None
+    except OSError:
+        return None, "report_not_regular"
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None, "report_not_regular"
+        if st.st_size > REPORT_MAX_BYTES:
+            return None, "report_too_large"
+        data = os.read(fd, REPORT_MAX_BYTES + 1)
+        if len(data) > REPORT_MAX_BYTES:
+            return None, "report_too_large"
+        return data.decode("utf-8", "replace"), None
+    except OSError:
+        return None, "report_not_regular"
+    finally:
+        os.close(fd)
+
+
 def main() -> int:
     if not _set_nondumpable():
         _emit(-1, error="nodumpable")
@@ -138,12 +242,11 @@ def main() -> int:
         return 0
     try:
         names = safe_extract(data, WORK)
-    except ValueError as exc:
+    except (ValueError, OSError) as exc:
         _emit(-1, error=f"bad_tar: {exc}")
         return 0
     tests = [n for n in names if TEST_RE.fullmatch(n.rsplit("/", 1)[-1])]
     REPORT.unlink(missing_ok=True)
-    timeout = int(os.environ.get("PEH_INNER_TIMEOUT", "25"))
     argv = [
         sys.executable,
         "-m",
@@ -155,31 +258,17 @@ def main() -> int:
         "--",
         *tests,
     ]
-    try:
-        child = subprocess.run(  # noqa: S603
-            argv,
-            cwd=WORK,
-            env=CHILD_ENV,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            timeout=timeout,
-            close_fds=True,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        _emit(
-            -1,
-            stdout_tail=_tail(exc.stdout),
-            stderr_tail=_tail(exc.stderr),
-            error="inner_timeout",
-        )
+    rc, out, err, timed_out = _run_child(argv, _timeout_from_env())
+    if timed_out:
+        _emit(-1, stdout_tail=_tail(out), stderr_tail=_tail(err), error="inner_timeout")
         return 0
-    junit = REPORT.read_text(encoding="utf-8", errors="replace") if REPORT.exists() else None
+    junit, report_error = _read_report()
     _emit(
-        child.returncode,
+        rc,
         junit_xml=junit,
-        stdout_tail=_tail(child.stdout),
-        stderr_tail=_tail(child.stderr),
+        stdout_tail=_tail(out),
+        stderr_tail=_tail(err),
+        error=report_error,
     )
     return 0
 

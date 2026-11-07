@@ -83,3 +83,49 @@ def test_extract_rejects_oversize(tmp_path: Path) -> None:
 def test_extract_rejects_non_tar(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="tar"):
         runner.safe_extract(b"not a tar", tmp_path / "w")
+
+
+def test_extract_rejects_long_name(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="too long"):
+        runner.safe_extract(_tar([("a" * 256, b"x")]), tmp_path / "w")
+    with pytest.raises(ValueError, match="too long"):
+        runner.safe_extract(_tar([("a" * 101 + ".py", b"x")]), tmp_path / "w")
+
+
+def test_extract_collision_file_then_dir_is_oserror(tmp_path: Path) -> None:
+    with pytest.raises(OSError):
+        runner.safe_extract(_tar([("a", b"x"), ("a/b.py", b"x")]), tmp_path / "w")
+
+
+def test_extract_collision_dir_then_file_is_oserror(tmp_path: Path) -> None:
+    with pytest.raises(OSError):
+        runner.safe_extract(_tar([("a/b.py", b"x"), ("a", b"x")]), tmp_path / "w")
+
+
+def test_extract_rejects_duplicate(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="duplicate"):
+        runner.safe_extract(_tar([("a.py", b"1"), ("a.py", b"2")]), tmp_path / "w")
+
+
+def test_extract_rejects_leading_dash(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="dash"):
+        runner.safe_extract(_tar([("-x/test_a.py", b"x")]), tmp_path / "w")
+
+
+def test_extract_rejects_report_xml(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match=r"report\.xml"):
+        runner.safe_extract(_tar([("report.xml", b"x")]), tmp_path / "w")
+
+
+def test_tail_bounded_after_decode() -> None:
+    assert len(runner._tail(b"\xff" * 100_000).encode()) <= 16384
+    assert len(runner._tail("é" * 100_000).encode()) <= 16384
+    assert runner._tail(None) == ""
+
+
+def test_timeout_env_robust(monkeypatch: pytest.MonkeyPatch) -> None:
+    for bad in ("abc", "0", "-5", ""):
+        monkeypatch.setenv("PEH_INNER_TIMEOUT", bad)
+        assert runner._timeout_from_env() == 25
+    monkeypatch.setenv("PEH_INNER_TIMEOUT", "7")
+    assert runner._timeout_from_env() == 7
