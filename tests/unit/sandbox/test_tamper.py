@@ -26,7 +26,7 @@ def test_scan_flags_report_xml_literal() -> None:
 
 
 def test_scan_info_only_inspect() -> None:
-    rep = scan("import inspect\nprint(inspect.stack())\n")
+    rep = scan("import inspect\nprint(inspect.signature(len))\n")
     assert rep.forgery == ()
     assert "inspect" in rep.info
 
@@ -75,9 +75,8 @@ def test_scan_flags_forgery_variants(code: str) -> None:
     ("code", "tag"),
     [
         ("import sys\nsys.exit(0)", "sys.exit"),
-        ("import gc\ngc.get_objects()", "gc.get_objects"),
         ("open('test_hidden.py').read()", "open_test_file"),
-        ("from inspect import stack", "inspect"),
+        ("from inspect import signature", "inspect"),
     ],
 )
 def test_scan_info_patterns(code: str, tag: str) -> None:
@@ -104,6 +103,40 @@ def test_syntax_error_is_info_not_forgery() -> None:
 )
 def test_scan_false_positives_are_clean(code: str) -> None:
     assert scan(code).forgery == ()
+
+
+def test_scan_uses_the_bytes_cpython_would_run() -> None:
+    latin1 = b"# -*- coding: latin-1 -*-\nx = '\xe9'\nimport os\nos._exit(0)\n"
+    assert "attr:_exit" in scan(latin1).forgery
+    assert "attr:_exit" in scan("\ufeffimport os\nos._exit(0)\n").forgery
+    assert "attr:_exit" in scan(b"\xef\xbb\xbfimport os\nos._exit(0)\n").forgery
+    assert scan(b"\xff\xfe\x00bad").info == ("syntax_error",)
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        'import os\nos.execv("/bin/true", ["true"])',
+        "import os\nos.execvpe('a', [], {})",
+        "from os import execv\nexecv('a', [])",
+        "x.execlp('a', 'a')",
+        "import sys\nsys._getframe(1)",
+        "import inspect\ninspect.currentframe()",
+        "import inspect as i\ni.stack()",
+        "from inspect import trace",
+        "import gc\ngc.get_objects()",
+        "import gc\ngc.get_referrers(1)",
+        "import gc as g\ng.get_referents(1)",
+    ],
+)
+def test_scan_flags_clean_exit_and_introspection_paths(code: str) -> None:
+    assert scan(code).forgery
+
+
+def test_inspect_signature_stays_info_only() -> None:
+    rep = scan("import inspect\ninspect.signature(len)")
+    assert rep.forgery == ()
+    assert "inspect" in rep.info
 
 
 def test_scan_never_executes_code() -> None:

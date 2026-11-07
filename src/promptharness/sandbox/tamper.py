@@ -13,6 +13,16 @@ __all__ = ["TamperReport", "scan"]
 
 _FORBIDDEN_MODULES = frozenset({"pytest", "_pytest", "ctypes", "faulthandler"})
 _OS_KILLS = frozenset({"kill", "killpg"})
+# Process replacement: the new image can exit 0 before pytest writes its own report.
+_EXEC_FAMILY = frozenset(
+    {"execv", "execve", "execl", "execle", "execlp", "execlpe", "execvp", "execvpe"}
+)
+# Frame and object walking that can reach pytest internals (module -> attribute names).
+_INTROSPECTION = {
+    "sys": frozenset({"_getframe"}),
+    "inspect": frozenset({"currentframe", "stack", "trace"}),
+    "gc": frozenset({"get_objects", "get_referrers", "get_referents"}),
+}
 _DYNAMIC = frozenset({"exec", "eval", "compile"})
 _BUILTINS_BASES = frozenset({"builtins", "__builtins__"})
 _MODULES_MUTATORS = frozenset({"update", "__setitem__", "__delitem__", "setdefault", "pop"})
@@ -56,6 +66,9 @@ class _Scanner(ast.NodeVisitor):
         self.info: set[str] = set()
         self._os = _module_aliases(tree, "os")
         self._sys = _module_aliases(tree, "sys")
+        self._intro = {
+            mod: (_module_aliases(tree, mod), attrs) for mod, attrs in _INTROSPECTION.items()
+        }
         self._doc_ids = _docstring_like_ids(tree)
 
     def _is_os(self, node: ast.AST) -> bool:
@@ -97,6 +110,10 @@ class _Scanner(ast.NodeVisitor):
                 self.forgery.add("attr:_exit")
             if node.module == "os" and alias.name in _OS_KILLS:
                 self.forgery.add(f"attr:{alias.name}")
+            if alias.name in _EXEC_FAMILY:
+                self.forgery.add(f"attr:{alias.name}")
+            if node.module in _INTROSPECTION and alias.name in _INTROSPECTION[node.module]:
+                self.forgery.add(f"introspection:{node.module}.{alias.name}")
             if node.module == "sys" and alias.name == "modules":
                 self.forgery.add("sys.modules")
             if not node.module:
@@ -106,15 +123,18 @@ class _Scanner(ast.NodeVisitor):
     def visit_Attribute(self, node: ast.Attribute) -> None:
         if node.attr == "_exit":
             self.forgery.add("attr:_exit")
+        if node.attr in _EXEC_FAMILY:
+            self.forgery.add(f"attr:{node.attr}")
         if node.attr in _OS_KILLS and self._is_os(node.value):
             self.forgery.add(f"attr:{node.attr}")
         if isinstance(node.value, ast.Name):
             base = node.value.id
             if base in self._sys and node.attr == "exit":
                 self.info.add("sys.exit")
-            if base == "gc" and node.attr == "get_objects":
-                self.info.add("gc.get_objects")
-            if base == "inspect":
+            for mod, (names, attrs) in self._intro.items():
+                if base in names and node.attr in attrs:
+                    self.forgery.add(f"introspection:{mod}.{node.attr}")
+            if base in self._intro["inspect"][0]:
                 self.info.add("inspect")
             if base in self._sys and node.attr == "modules" and isinstance(node.ctx, ast.Store):
                 self.forgery.add("sys.modules")
@@ -169,14 +189,16 @@ class _Scanner(ast.NodeVisitor):
         self.generic_visit(node)
 
 
-def scan(code: str) -> TamperReport:
+def scan(code: bytes | str) -> TamperReport:
     """Return forgery (verdict-changing) and info (diagnostic only) findings for ``code``.
 
     ``unscannable`` (RecursionError) is forgery on purpose: such code parses, so it does run.
     """
+    # Parse the bytes the container runs, so BOM and coding cookies are honoured the same way.
+    source = code.encode("utf-8") if isinstance(code, str) else code
     try:
-        tree = ast.parse(code)
-    except (SyntaxError, ValueError):
+        tree = ast.parse(source, feature_version=(3, 12))
+    except (SyntaxError, ValueError, UnicodeDecodeError):
         # Code that does not parse cannot run, so it cannot forge anything (R38).
         return TamperReport(forgery=(), info=("syntax_error",))
     scanner = _Scanner(tree)

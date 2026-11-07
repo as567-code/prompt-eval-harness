@@ -19,7 +19,6 @@ def _run(runner: SandboxRunner, solution: str, tests: str = TESTS) -> SandboxRes
     return runner.run(
         {"solution.py": solution, "test_hidden.py": tests},
         test_files=["test_hidden.py"],
-        candidate=solution,
     )
 
 
@@ -48,7 +47,9 @@ def test_forged_report_with_os_exit_is_tamper(runner: SandboxRunner) -> None:
     assert "report.xml" in res.detail
     # Without the scan the same container outcome is a clean PASSED: this is what the scan closes.
     unscanned = runner.run(
-        {"solution.py": solution, "test_hidden.py": TESTS}, test_files=["test_hidden.py"]
+        {"solution.py": solution, "test_hidden.py": TESTS},
+        test_files=["test_hidden.py"],
+        scan_candidate=False,
     )
     assert unscanned.status is SandboxStatus.PASSED, unscanned
 
@@ -72,6 +73,24 @@ def _envelope_printing_solution(*, obfuscate_key: bool) -> str:
         "print(json.dumps(d))\n"
         "def f():\n    return 2\n"
     )
+
+
+def test_forged_report_with_execv_is_tamper(runner: SandboxRunner) -> None:
+    """Process replacement exits 0 before pytest writes its report; the scan closes that hole."""
+    solution = (
+        "import os\n"
+        f"with open('/work/report.xml', 'w') as fh:\n    fh.write({FAKE_JUNIT!r})\n"
+        "os.execv('/bin/true', ['true'])\n"
+    )
+    res = _run(runner, solution)
+    assert res.status is SandboxStatus.TAMPER_SUSPECT, res
+    assert "execv" in res.detail
+    unscanned = runner.run(
+        {"solution.py": solution, "test_hidden.py": TESTS},
+        test_files=["test_hidden.py"],
+        scan_candidate=False,
+    )
+    assert unscanned.status is SandboxStatus.PASSED, unscanned
 
 
 def test_fake_envelope_on_stdout(runner: SandboxRunner) -> None:
